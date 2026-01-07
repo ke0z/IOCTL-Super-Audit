@@ -1,33 +1,33 @@
-# IDA IOCTL Super Audit Plugin
+# 🔍 IDA IOCTL Super Audit Plugin
 
 An advanced IDA Pro plugin for auditing Windows kernel drivers for IOCTL (Input/Output Control) vulnerabilities. This tool automatically scans binary code for IOCTL handlers, decodes IOCTL codes, and performs vulnerability analysis using static heuristics.
 
-## Features
+## ✨ Features
 
-- **Robust IOCTL Detection**: Scans for immediate operands in code, classifying them as potential IOCTL codes using multiple detection methods (FULL, DEVICE_TYPE_LIKE, FUNCTION_SHIFTED, etc.)
-- **Vulnerability Auditing**: Analyzes decompiled pseudocode for common Windows driver vulnerabilities:
-  - Unsafe memory operations (memcpy, strcpy)
-  - System calls (Zw* functions)
-  - Memory management issues (Mm* APIs)
-  - Handle manipulation
-  - Process/thread manipulation
-  - File and registry operations
-  - User buffer handling issues
-  - Large stack buffers
-- **Interactive Results**: Displays findings in sortable tables within IDA Pro
-- **Multiple Output Formats**:
-  - CSV files for IOCTL codes and vulnerabilities
-  - SARIF format for integration with security tools
-- **Version Compatibility**: Supports IDA SDK 7, 8, and 9
-- **Performance Optimized**: Efficient scanning with memory management and progress tracking
+- **Robust IOCTL Detection** 🔍: Scans for immediate operands in code, classifying them as potential IOCTL codes using multiple detection methods (FULL, DEVICE_TYPE_LIKE, FUNCTION_SHIFTED, etc.)
+- **Vulnerability Auditing** 🛡️: Analyzes decompiled pseudocode for common Windows driver vulnerabilities:
+  - ✅ Unsafe memory operations (memcpy, strcpy)
+  - ✅ System calls (Zw* functions)
+  - ✅ Memory management issues (Mm* APIs)
+  - ✅ Handle manipulation
+  - ✅ Process/thread manipulation
+  - ✅ File and registry operations
+  - ✅ User buffer handling issues
+  - ✅ Large stack buffers
+- **Interactive Results** 📊: Displays findings in sortable tables within IDA Pro
+- **Multiple Output Formats** 📄:
+  - ✅ CSV files for IOCTL codes and vulnerabilities
+  - ✅ SARIF format for integration with security tools
+- **Version Compatibility** 🔄: Supports IDA SDK 7, 8, and 9
+- **Performance Optimized** ⚡: Efficient scanning with memory management and progress tracking
 
-## Requirements
+## 💻 Requirements
 
 - IDA Pro 7.0 or later
 - Hex-Rays Decompiler (optional, for enhanced vulnerability detection)
 - Python 3.x (included with IDA)
 
-## Installation
+## 📥 Installation
 
 1. Download `IDA_WinDriverAuditorIOCTL_finder.py`
 2. Copy the file to your IDA plugins directory:
@@ -35,7 +35,7 @@ An advanced IDA Pro plugin for auditing Windows kernel drivers for IOCTL (Input/
    - Linux/Mac: `~/.idapro/plugins/`
 3. Restart IDA Pro or reload plugins
 
-## Usage
+## ▶️ Usage
 
 ### As a Plugin
 1. Load a Windows driver binary in IDA Pro
@@ -50,7 +50,7 @@ exec(open(r"path\to\IDA_WinDriverAuditorIOCTL_finder.py").read())
 scan_ioctls_and_audit()
 ```
 
-## Output
+## 📊 Output
 
 The plugin generates several files in the same directory as the input binary:
 
@@ -78,7 +78,7 @@ SARIF (Static Analysis Results Interchange Format) file for integration with sec
 - **IOCTL Vulnerabilities**: Table showing all vulnerability findings
 - Double-click any row to jump to the corresponding address in IDA
 
-## IOCTL Code Structure
+## 📐 IOCTL Code Structure
 
 The plugin decodes IOCTL codes according to the Windows CTL_CODE macro:
 
@@ -95,7 +95,7 @@ The plugin decodes IOCTL codes according to the Windows CTL_CODE macro:
 - **Function**: 12-bit function code
 - **Method**: 2-bit transfer method (0-3)
 
-## Vulnerability Detection
+## ⚠️ Vulnerability Detection
 
 The plugin uses regex patterns to detect common vulnerability classes:
 
@@ -110,14 +110,14 @@ Risk scoring considers:
 - Presence of unsafe functions
 - Buffer size analysis
 
-## Compatibility
+## 🔄 Compatibility
 
 - **IDA 7.x**: Uses Choose2 for table display
 - **IDA 8.x/9.x**: Uses Choose for table display
 - Automatic detection of available APIs
 - Fallback mechanisms for different IDA versions
 
-## Troubleshooting
+## ❓ Troubleshooting
 
 ### No IOCTLs Detected
 - Ensure the binary is a Windows kernel driver
@@ -134,17 +134,17 @@ Risk scoring considers:
 - The plugin includes memory management to prevent hangs
 - Use the control panel (if implemented) to pause/resume scanning
 
-## Contributing
+## 🤝 Contributing
 
 Contributions are welcome! Please:
 1. Fork the repository
 2. Create a feature branch
 3. Submit a pull request with detailed description
 
-## License
+## ⚖️ License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Disclaimer
+## ⚠️ Disclaimer
 
 This tool is for research and security auditing purposes only. Use responsibly and in accordance with applicable laws and regulations.
