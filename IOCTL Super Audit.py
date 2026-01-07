@@ -236,15 +236,16 @@ def get_operand_value(ea, op):
 # Main audit engine (updated to be more robust)
 # -------------------------------------------------
 
-def scan_ioctls_and_audit(max_immediate=None):
+def scan_ioctls_and_audit(max_immediate=None, verbosity=0, min_ioctl=0, max_ioctl=0xFFFFFFFF):
     min_ea, max_ea = resolve_inf_bounds()
-    idaapi.msg(f"[IOCTL Audit] Scanning {hex(min_ea)} - {hex(max_ea)}\n")
+    if verbosity >= 1:
+        idaapi.msg(f"[IOCTL Audit] Scanning range {hex(min_ea)} - {hex(max_ea)}\n")
+    else:
+        idaapi.msg(f"[IOCTL Audit] Scanning {hex(min_ea)} - {hex(max_ea)}\n")
 
     occs = []
-    # iterate program heads (only code like original, but more robust)
+    # iterate program heads - DO NOT filter by code type, scan everything like the working script
     for ea in idautils.Heads(min_ea, max_ea):
-        if not ida_bytes.is_code(ida_bytes.get_full_flags(ea)):
-            continue
         # try a few operand indexes (safe bound)
         for op_idx in range(6):
             try:
@@ -256,28 +257,36 @@ def scan_ioctls_and_audit(max_immediate=None):
                         continue
                     if max_immediate is not None and raw > max_immediate:
                         continue
-                    occs.append({'ea': ea, 'op': op_idx, 'raw': raw})
+                    # Convert to unsigned 32-bit and apply range filter
+                    raw_u32 = raw & 0xFFFFFFFF
+                    if min_ioctl <= raw_u32 <= max_ioctl:
+                        occs.append({'ea': ea, 'op': op_idx, 'raw': raw_u32})
                 else:
                     # Some IDA builds don't give op type reliably.
                     # Try to read operand value and heuristically accept small/32-bit immediates.
                     raw = get_operand_value(ea, op_idx)
                     if raw is None:
                         continue
-                    # Heuristic: treat values <= 0xFFFFFFFF and >= 0 as candidate immediates
-                    if isinstance(raw, int) and 0 <= raw <= 0xFFFFFFFF:
-                        occs.append({'ea': ea, 'op': op_idx, 'raw': raw})
+                    # Heuristic: treat values in 0-0xFFFFFFFF as candidate immediates (handle signed/unsigned)
+                    if isinstance(raw, int):
+                        raw_u32 = raw & 0xFFFFFFFF
+                        if min_ioctl <= raw_u32 <= max_ioctl:
+                            occs.append({'ea': ea, 'op': op_idx, 'raw': raw_u32})
             except Exception:
                 # ignore single-op errors
                 continue
 
-    idaapi.msg(f"[IOCTL Audit] Found {len(occs)} candidate immediates\n")
+    if verbosity >= 1:
+        idaapi.msg(f"[IOCTL Audit] Found {len(occs)} candidate immediates\n")
+    else:
+        idaapi.msg(f"[IOCTL Audit] Found {len(occs)} candidate immediates\n")
 
     ioctls = []
     findings = []
     sarif_results = []
 
     for occ in occs:
-        raw_u32 = occ['raw'] & 0xFFFFFFFF
+        raw_u32 = occ['raw']  # Already masked to 32-bit in scan function
         dec = decode_ioctl(raw_u32)
         
         # Classify the match type like original
@@ -425,6 +434,8 @@ class IoctlTable(ChooseClass):
         ]
 
     def OnSelectLine(self, n):
+        if isinstance(n, (list, tuple)):
+            n = n[0]
         item = self.items[n]
         ea = int(item["ea"], 16)
         ida_kernwin.jumpto(ea)
@@ -462,6 +473,8 @@ class FindingsTable(ChooseClass):
         ]
 
     def OnSelectLine(self, n):
+        if isinstance(n, (list, tuple)):
+            n = n[0]
         item = self.items[n]
         ea = int(item["ea"], 16)
         ida_kernwin.jumpto(ea)
@@ -492,9 +505,64 @@ class IoctlSuperAuditPlugin(idaapi.plugin_t):
         return idaapi.PLUGIN_OK
 
     def run(self, arg):
+        # Use separate dialog calls for better compatibility
+        
+        # Ask for verbose output
+        verbose = ida_kernwin.ask_yn(1, "Enable verbose output?")
+        if verbose is None:
+            return  # User cancelled
+        
+        # Ask if user wants to filter by IOCTL range
+        filter_range = ida_kernwin.ask_yn(0, "Filter IOCTLs by range?\n(Answer 'No' to scan full range 0x0-0xFFFFFFFF)")
+        if filter_range is None:
+            return  # User cancelled
+        
+        # Default to full range
+        min_ioctl = 0x0
+        max_ioctl = 0xFFFFFFFF
+        
+        # Only ask for range if user wants to filter
+        if filter_range:
+            min_ioctl_input = ida_kernwin.ask_str("0", 0, "Enter Min IOCTL (hex):")
+            if min_ioctl_input is None:
+                return  # User cancelled
+            
+            max_ioctl_input = ida_kernwin.ask_str("FFFFFFFF", 0, "Enter Max IOCTL (hex):")
+            if max_ioctl_input is None:
+                return  # User cancelled
+            
+            # Parse hex inputs with robust error handling
+            try:
+                min_str = min_ioctl_input.strip()
+                max_str = max_ioctl_input.strip()
+                
+                # Parse with defaults
+                min_ioctl = int(min_str, 16) if min_str else 0x0
+                max_ioctl = int(max_str, 16) if max_str else 0xFFFFFFFF
+                
+                # Validate range
+                if min_ioctl > max_ioctl:
+                    ida_kernwin.warning("Min IOCTL cannot be greater than Max IOCTL. Using full range.")
+                    min_ioctl = 0x0
+                    max_ioctl = 0xFFFFFFFF
+                    
+            except (ValueError, TypeError) as e:
+                ida_kernwin.warning(f"Invalid hex input: {str(e)}. Using full range (0x0 to 0xFFFFFFFF).")
+                min_ioctl = 0x0
+                max_ioctl = 0xFFFFFFFF
+        
+        verbosity = 1 if verbose else 0
+        
+        if verbosity >= 1:
+            if filter_range:
+                idaapi.msg(f"[IOCTL Audit] Starting scan with settings: Verbose={verbose}, Min={hex(min_ioctl)}, Max={hex(max_ioctl)}\n")
+            else:
+                idaapi.msg(f"[IOCTL Audit] Starting scan with settings: Verbose={verbose}, Full range (no filter)\n")
+        
         try:
-            scan_ioctls_and_audit()
-        except Exception:
+            scan_ioctls_and_audit(verbosity=verbosity, min_ioctl=min_ioctl, max_ioctl=max_ioctl)
+        except Exception as e:
+            ida_kernwin.warning(f"Audit failed: {str(e)}")
             traceback.print_exc()
 
     def term(self):
