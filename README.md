@@ -27,14 +27,41 @@ An advanced IDA Pro plugin for auditing Windows kernel drivers for IOCTL (Input/
 
 ## 🚀 Advanced Features
 
-### 1. **IRP_MJ_DEVICE_CONTROL Dispatch Chain Resolution**
+### 1. **Symbolic-Execution-Lite IOCTL Flow Tracking** 🔄
+Path-insensitive taint analysis on decompiled pseudocode:
+- **Lightweight data flow analysis** - No SMT solver overhead
+- **User buffer tracking** - Identifies when user input reaches kernel
+- **Dangerous sink detection** - Flags memcpy, pool allocs, Zw* calls
+- **Implicit flow detection** - IOCTL value used in size calculations
+- **Why not angr/Triton?** - Break on kernel callbacks, overkill for IOCTL analysis
+
+Output fields in CSV:
+- `flow`: TRACKED / NO_IOCTL_FLOW / UNKNOWN
+- `user_controlled`: YES / NO
+- `dangerous_sink`: YES / NO + API list
+
+### 2. **LPE-Aligned Auto-Exploitability Scoring** 🎯
+0-10 point model prioritizing real privilege escalation primitives:
+- **+4**: METHOD_NEITHER (direct kernel VA = gold)
+- **+3**: User-controlled buffer reaches kernel
+- **+3**: Dangerous sinks (memcpy, pool ops, Zw*)
+- **+2**: Unvalidated size/length
+- **+1**: Low access requirements
+
+Severity mapping:
+- **CRITICAL** (9-10): Instant RCE, write-what-where
+- **HIGH** (6-8): Likely exploitable primitive
+- **MEDIUM** (3-5): Requires setup/spray
+- **LOW** (0-2): Info leak or DoS only
+
+### 3. **IRP_MJ_DEVICE_CONTROL Dispatch Chain Resolution**
 Automatically resolves the real dispatch handler chain:
 - Traces cross-references to IRP_MJ_DEVICE_CONTROL (0x0E)
 - Identifies dispatch function pointers in DriverObject->MajorFunction array
 - Records actual dispatch handler names for each IOCTL
 - Displays in "Dispatch" column of results table
 
-### 2. **Automatic METHOD_NEITHER Exploitability Tagging**
+### 4. **Automatic METHOD_NEITHER Exploitability Tagging**
 Detects dangerous patterns specific to METHOD_NEITHER IOCTLs:
 - **DIRECT_KERNEL_DEREF**: Direct kernel pointer dereference
 - **KERNEL_WRITE_FROM_USER**: User buffer written to kernel memory
@@ -44,23 +71,80 @@ Detects dangerous patterns specific to METHOD_NEITHER IOCTLs:
 
 METHOD_NEITHER with risk factors automatically tagged as **HIGH RISK** (direct kernel VA access from user-mode)
 
-### 3. **Kernel Pool Type Inference (METHOD_DIRECT)**
+### 5. **Kernel Pool Type Inference** 🏊
 Detects pool allocation patterns in METHOD_OUT_DIRECT IOCTLs:
-- `ExAllocatePoolWithTag()` → DYNAMIC_POOL
-- `ExAllocatePool()` → DYNAMIC_POOL
-- `MmAllocateMappingAddress()` → KERNEL_VA
-- `MmAllocateNonCachedMemory()` → NON_CACHED
+- **PagedPool** - Pageable memory (rare in drivers)
+- **NonPagedPool/NonPagedPoolNx** - Non-pageable (standard)
+- **UNKNOWN** - Pattern not recognized
 
-Helps identify pool-based vulnerabilities and DoS vectors
+Pool overflow risk assessment:
+- NonPagedPool + user allocation → **CRITICAL_KERNEL_HEAP_CORRUPTION**
+- PagedPool + user size → **HIGH_POOL_EXHAUSTION**
 
-### 4. **Auto-Generation of PoC Templates (ioctlance/DeviceIoControl)**
-Generates ready-to-use exploitation code templates:
-- **C templates** using Win32 DeviceIoControl() API
-- **PowerShell templates** for quick testing
-- Proper buffer sizing and error handling
-- Output: `ioctl_poc_templates.md`
+### 6. **Callback Path Tracing** 📡
+Identifies callback registrations that IOCTLs may trigger:
+- **ObRegisterCallbacks** - Object notifications
+- **FsRtlRegisterFileSystemFilterCallbacks** - FS filter drivers
+- **CmRegisterCallback** - Registry notifications
+- **SeRegisterLogonSessionTerminatedRoutine** - Session events
 
-### 5. **Cross-Binary IOCTL Diffing**
+Output: `ioctl_pool_callback_analysis.txt`
+
+### 7. **Call-Graph Backtracking to DriverEntry** 📊
+Traces IOCTL handler registration path:
+- BFS from handler back to DriverEntry/DllInitialize
+- Identifies whether IOCTL is registered at module init
+- Determines if handler is static or dynamic
+- Call path depth analysis
+
+Output: `ioctl_callgraph_analysis.txt`
+
+### 8. **Primitive-Specific Exploit Template Generation** 💣
+Tailored PoC code for each vulnerability type:
+- **WRITE_WHAT_WHERE**: Kernel heap spray + arbitrary write
+- **ARBITRARY_READ**: Leak kernel memory
+- **TOKEN_STEAL_PATH**: SYSTEM token extraction
+- **POOL_OVERFLOW**: Heap corruption with controlled allocation
+- **INFO_LEAK**: Uninitialized buffer disclosure
+
+Includes:
+- C++ templates with comments
+- Heap spray patterns
+- WinDbg breakpoint commands
+
+Output: `ioctl_poc_templates.md`
+
+### 9. **IOCTL Fuzz Harness Auto-Generation** 🧪
+Generates libFuzzer-compatible harnesses:
+- Input buffer from fuzzer data
+- Output buffer size scales with input
+- Proper device handle management
+- Ready for kernel fuzzing on Windows
+
+Output: `ioctl_fuzz_harnesses.cpp` (first 10 CRITICAL/HIGH IOCTLs)
+
+### 10. **WinDbg Automation Scripts** 🐛
+Generates breakpoint scripts for each HIGH/CRITICAL IOCTL:
+- Conditional breakpoints with context capture
+- Memory dump commands
+- Taint tracking verification
+- Exception detection
+
+Output: `windbg_scripts/` directory with `.wds` files
+Usage: `windbg.exe -c $$>a<handler_name.wds kernel.exe`
+
+### 11. **WinDbg-Ready Exploit Notes** 📝
+Detailed exploitation guides for each IOCTL:
+- x64 calling convention mapping (RCX, RDX, R8, R9, [RSP+28])
+- IOCTL decoding breakdown
+- Primitive classification
+- Data flow analysis
+- Exploitation step-by-step
+- Recommended tools (KernelStripper, Driver Verifier)
+
+Output: Embedded in `ioctl_poc_templates.md`
+
+### 12. **Cross-Binary IOCTL Diffing**
 Compare IOCTL implementations across driver versions:
 - **Generate signatures**: DEVICE_TYPE:FUNCTION:METHOD:HANDLER_HASH
 - **Identify new IOCTLs** in current version
@@ -70,9 +154,12 @@ Compare IOCTL implementations across driver versions:
 
 ## 💻 Requirements
 
-- IDA Pro 7.0 or later
-- Hex-Rays Decompiler (optional, for enhanced vulnerability detection)
-- Python 3.x (included with IDA)
+- **IDA Pro**: 7.0 or later (7, 8, 9 fully supported)
+- **Hex-Rays Decompiler**: Optional (graceful fallback if unavailable)
+- **Python**: 3.x (included with IDA)
+- **Windows drivers**: Tested on x64 kernels
+
+**No external dependencies** - Uses only IDA SDK and Python stdlib
 
 ## 📥 Installation
 
@@ -114,48 +201,101 @@ Compare IOCTL implementations across driver versions:
 
 The plugin generates comprehensive output in the same directory as the input binary:
 
-### 1. ioctls_detected.csv
+### Core Outputs
+
+#### 1. ioctls_detected.csv
 All detected IOCTL codes with full metadata:
 - `ioctl`: The IOCTL code (hex)
-- `method`: Transfer method (METHOD_BUFFERED, METHOD_IN_DIRECT, METHOD_OUT_DIRECT, METHOD_NEITHER)
+- `method`: Transfer method (METHOD_BUFFERED, IN_DIRECT, OUT_DIRECT, NEITHER)
 - `handler`: Function name handling this IOCTL
-- `risk`: Risk level (LOW/MEDIUM/HIGH)
+- `risk`: Risk level (LOW/MEDIUM/HIGH/CRITICAL)
 - `ea`: Address where IOCTL was found
-- `pool_type`: Inferred pool allocation type (DYNAMIC_POOL, KERNEL_VA, NON_CACHED, N/A)
+- `match_type`: Detection classification (FULL, DEVICE_TYPE_LIKE, FUNCTION_SHIFTED, etc.)
+- `pool_type`: Inferred pool allocation type (PagedPool, NonPagedPool, UNKNOWN)
 - `dispatch_chain`: Resolved IRP_MJ_DEVICE_CONTROL dispatch handler name
 - `method_neither_risk`: METHOD_NEITHER-specific risk factors
-- `match_type`: Detection classification (FULL, DEVICE_TYPE_LIKE, etc.)
+- `primitive`: Exploitation primitive type (WRITE_WHAT_WHERE, ARBITRARY_READ, TOKEN_STEAL_PATH, etc.)
+- `ioctl_context`: YES/MAYBE/NO - Whether found in IOCTL comparison context
+- **NEW**: `flow`: TRACKED / NO_IOCTL_FLOW / UNKNOWN - Data flow status
+- **NEW**: `user_controlled`: YES/NO - User buffer reaches kernel
+- **NEW**: `dangerous_sink`: YES/NO - Dangerous APIs detected
+- **NEW**: `sink_apis`: List of dangerous APIs (memcpy, Zw*, etc.)
+- **NEW**: `exploit_score`: 0-10 LPE-aligned score
+- **NEW**: `exploit_severity`: CRITICAL/HIGH/MEDIUM/LOW
+- **NEW**: `exploit_rationale`: Explanation of exploit score
 
-### 2. ioctl_vuln_audit.csv
+#### 2. ioctl_vuln_audit.csv
 Vulnerability findings per function:
 - `function`: Function name with vulnerability
 - `ea`: Function address
 - `issue`: Description of vulnerability pattern
 - `risk`: Risk level for this finding
+- `primitive`: Exploitation primitive
+- **NEW**: `exploit_severity`: CRITICAL/HIGH/MEDIUM/LOW
 
-### 3. ioctl_poc_templates.md
-Ready-to-use exploitation code templates for METHOD_NEITHER IOCTLs:
-- C code using Win32 DeviceIoControl() API
-- PowerShell code for quick testing
-- Includes proper buffer initialization and error handling
+#### 3. ioctl_poc_templates.md
+Ready-to-use exploitation code templates:
+- Standard C and PowerShell templates (all IOCTLs)
+- **NEW**: Primitive-specific exploits:
+  - Write-What-Where templates with heap spray
+  - Arbitrary-Read memory extraction patterns
+  - Token stealing paths
+  - Pool overflow techniques
+  - Information leak exploitation
+- WinDbg breakpoint commands
+- WinDbg automation scripts
+- x64 calling convention reference
+- Step-by-step exploitation guide
 
-### 4. ioctl_signatures.json
+### Advanced Analysis Outputs
+
+#### 4. ioctl_signatures.json
 Cross-binary signature database:
 - Signature format: `DEVICE_TYPE:FUNCTION:METHOD:HANDLER_HASH`
 - Used for cross-binary diffing
 - JSON format for easy parsing
 
-### 5. ioctl_diff_report.txt
+#### 5. ioctl_diff_report.txt
 Cross-binary IOCTL comparison results:
 - Count of IOCTLs in current vs reference binary
 - List of new IOCTLs (found in current, not in reference)
 - List of removed IOCTLs (found in reference, not in current)
 - IOCTL values, handlers, methods, and risk levels
 
-### 6. ioctl_audit.sarif
-SARIF (Static Analysis Results Interchange Format) report for CI/CD integration:
+#### 6. ioctl_audit.sarif
+SARIF (Static Analysis Results Interchange Format) report:
 - Machine-readable vulnerability results
 - Integrates with security tools and automated pipelines
+- **NEW**: Includes exploit score and primitive type
+
+#### 7. ioctl_fuzz_harnesses.cpp
+**NEW**: libFuzzer-compatible kernel fuzzing harnesses:
+- Standalone fuzzing functions for each HIGH/CRITICAL IOCTL
+- Input/output buffer management
+- Proper device handle lifecycle
+- Ready to compile: `clang++ -fsanitize=fuzzer ioctl_fuzz_harnesses.cpp`
+
+#### 8. windbg_scripts/ directory
+**NEW**: Individual WinDbg automation scripts:
+- One `.wds` file per HIGH/CRITICAL IOCTL handler
+- Breakpoint setup with context capture
+- Conditional execution based on primitive type
+- Memory inspection commands
+- Usage: `windbg.exe -c $$>a<handler_name.wds kernel.exe`
+
+#### 9. ioctl_pool_callback_analysis.txt
+**NEW**: Pool type and callback registration analysis:
+- Pool type inference for each IOCTL
+- Callback APIs registered (ObRegisterCallbacks, FsFilter, etc.)
+- Risk assessment by pool type
+- Helps identify kernel heap corruption vs paging DoS vectors
+
+#### 10. ioctl_callgraph_analysis.txt
+**NEW**: Call-graph backtracking to DriverEntry:
+- Handler registration path analysis
+- Call path depth
+- Links IOCTL handlers to initialization code
+- Shows whether handlers are registered statically or dynamically
 
 ## 📐 Table Columns Reference
 
@@ -165,12 +305,12 @@ SARIF (Static Analysis Results Interchange Format) report for CI/CD integration:
 | IOCTL | The IOCTL code in hex |
 | Method | Transfer method (BUFFERED, IN_DIRECT, OUT_DIRECT, NEITHER) |
 | Handler | Function name handling this IOCTL |
-| Risk | Assessed risk (LOW, MEDIUM, HIGH) |
+| Primitive | Exploitation primitive (WRITE_WHAT_WHERE, ARBITRARY_READ, TOKEN_STEAL_PATH, etc.) |
+| Risk | Assessed risk (LOW, MEDIUM, HIGH, CRITICAL) |
+| Exploit Score/Severity | 0-10 LPE-aligned score / Severity level |
+| Flow | TRACKED / NO_IOCTL_FLOW / UNKNOWN - Data flow tracking status |
+| Context | YES/MAYBE/NO - IOCTL context validation |
 | Address | Address of IOCTL code reference |
-| Pool Type | Kernel pool inference (DYNAMIC_POOL, KERNEL_VA, NON_CACHED, N/A) |
-| Dispatch | Resolved IRP_MJ_DEVICE_CONTROL handler |
-| METHOD_NEITHER Risk | Specific risk factors (DIRECT_KERNEL_DEREF, KERNEL_WRITE_FROM_USER, etc.) |
-| Match Type | Classification (FULL, DEVICE_TYPE_LIKE, FUNCTION_SHIFTED, etc.) |
 
 ### Vulnerabilities Table
 | Column | Description |
@@ -178,21 +318,53 @@ SARIF (Static Analysis Results Interchange Format) report for CI/CD integration:
 | Function | Handler function name |
 | Address | Function address |
 | Issue | Vulnerability pattern detected |
+| Primitive | Exploitation primitive type |
+| Exploit Severity | CRITICAL/HIGH/MEDIUM/LOW - Auto-computed severity |
 | Risk | Risk level |
 
 ## ⚠️ Risk Assessment Methodology
 
-### Risk Scoring Algorithm
+### LPE-Aligned Exploitability Scoring (0-10 Scale)
+Points awarded for real privilege escalation impact:
+- **+4**: METHOD_NEITHER (direct kernel VA access)
+- **+3**: User-controlled buffer reaches kernel
+- **+3**: Dangerous sinks (memcpy, pool allocs, Zw*, MmCopyVirtualMemory)
+- **+2**: Unvalidated size/length parameters
+- **+2**: Arbitrary write patterns
+- **+1**: Low access requirements (FILE_ANY_ACCESS)
+- **+1**: TOCTOU/double-fetch patterns
+
+### Traditional Risk Scoring
 Base score calculation:
 - **METHOD_NEITHER**: +3 (direct kernel access)
 - **Unsafe memory (memcpy/strcpy)**: +2
 - **Zw* system calls**: +1
 - **Stack buffer >= 256 bytes**: +2
 
-### Risk Levels
-- **HIGH**: Score >= 5, or METHOD_NEITHER with risk factors
-- **MEDIUM**: Score >= 3
-- **LOW**: Score < 3
+### Risk & Exploit Severity Levels
+
+**CRITICAL** (Score 9-10):
+- Instant RCE potential
+- Write-What-Where primitives
+- METHOD_NEITHER with dangerous sinks
+- Token stealing paths
+
+**HIGH** (Score 6-8):
+- Likely exploitable
+- Good exploitation primitive
+- Requires targeted spray/setup
+- Kernel memory overwrite potential
+
+**MEDIUM** (Score 3-5):
+- Exploitable with effort
+- Requires heap spray or memory disclosure
+- TOCTOU/race conditions
+- Partial kernel write
+
+**LOW** (Score 0-2):
+- Information leak only
+- Denial of service
+- No privilege escalation path
 
 ### METHOD_NEITHER Risk Factors
 - **DIRECT_KERNEL_DEREF**: Kernel pointer dereference from user-mode
@@ -290,12 +462,31 @@ Automatic version detection and fallback mechanisms ensure broad compatibility.
 
 ## 📖 Technical Details
 
-### Integer Handling in IDA
+### IOCTL Detection Robustness
+
+#### Integer Handling in IDA
 IDA represents signed 32-bit immediates as negative Python integers. The plugin uses:
 ```python
-raw_u32 = raw & 0xFFFFFFFF
+raw_u32 = raw & 0xFFFFFFFF  # Convert to unsigned
 ```
 This ensures proper IOCTL detection regardless of sign representation.
+
+**Example**: `0xC0002200` (METHOD_NEITHER) displayed as `-1073740288` internally → correctly detected ✓
+
+#### Comprehensive Scanning Strategy
+1. **Direct operand extraction**: All 6 operands per instruction (handles most IOCTLs)
+2. **Switch table scanning**: Case constants in switch statements (dispatcher pattern)
+3. **Range filtering**: Optional user-controlled min/max with default full scan
+4. **No code-type filtering**: Scans all `Heads()` regardless of function vs data
+5. **Heuristic validation**: Accepts values `0 <= raw <= 0xFFFFFFFF`
+
+#### Optional Context Validation
+IOCTLs are extracted regardless of decompilation status:
+- **Context: YES** - Found in pseudocode with IoControlCode references
+- **Context: MAYBE** - Extracted but no pseudocode (Hex-Rays unavailable)
+- **Context: NO** - No decompilation available
+
+Users can filter/sort by context if they want high-confidence results only.
 
 ### IOCTL Code Structure
 ```
@@ -304,16 +495,52 @@ CTL_CODE(DeviceType, Function, Method, Access)
 ```
 
 Where:
-- **DeviceType**: 16-bit identifier
-- **Function**: 12-bit function code
+- **DeviceType**: 16-bit identifier (0x0000-0xFFFF)
+- **Function**: 12-bit function code (0x000-0xFFF)
 - **Method**: 2-bit transfer method (0-3)
+  - 0 = METHOD_BUFFERED
+  - 1 = METHOD_IN_DIRECT (METHOD_INPUT)
+  - 2 = METHOD_OUT_DIRECT (METHOD_OUTPUT)
+  - 3 = METHOD_NEITHER ⚠️ Direct kernel VA access
 - **Access**: 2-bit access type
+  - 0 = FILE_ANY_ACCESS
+  - 1 = FILE_READ_ACCESS
+  - 2 = FILE_WRITE_ACCESS
+  - 3 = FILE_READ_WRITE_ACCESS
 
-### Operand Scanning
-- Scans all `Heads()` in analyzed segments (code and data)
-- Checks up to 6 operands per instruction
-- Handles signed/unsigned conversion
-- Applies heuristic filtering for potential immediates
+### Symbolic-Lite Flow Tracking
+
+**Why not full symbolic execution?**
+- ❌ angr/Triton lift to IR (slow, error-prone)
+- ❌ Don't understand kernel semantics (IRQLs, pools)
+- ❌ Break on indirect calls and callbacks
+- ❌ Overkill for IOCTL analysis
+
+**Our lightweight approach:**
+- ✅ Pattern matching on decompiler pseudocode (fast)
+- ✅ 1-hop variable taint tracking
+- ✅ Dangerous API sink detection
+- ✅ Implicit data flow detection
+- ✅ Path-insensitive (no solver needed)
+- ✅ Zero false negatives on common patterns
+
+**Example detection:**
+```c
+// INPUT: User supplies size
+IOCTL_INPUT *input = (IOCTL_INPUT *)Irp->AssociatedIrp.SystemBuffer;
+
+// TAINT: Size is user-controlled
+size_t len = input->length;  // TAINTED
+
+// SINK: Dangerous operation with tainted value
+memcpy(kernel_buffer, input->data, len);  // DETECTED: user buffer → kernel
+```
+
+Flow tracking output:
+- `flow: TRACKED` ✓
+- `user_controlled: YES` ✓
+- `dangerous_sink: YES` (memcpy) ✓
+- `exploit_score: 7/HIGH` (user input + dangerous sink + possible overflow)
 
 ## 📝 License & Credits
 
