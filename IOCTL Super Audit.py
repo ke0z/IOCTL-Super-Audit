@@ -2490,7 +2490,8 @@ def generate_windbg_for_ioctl():
     func = ida_funcs.get_func(ea)
     if not func:
         return
-    script = generate_windbg_script(0x22000001, func.name, "WRITE_WHAT_WHERE", 9)
+    func_name = ida_funcs.get_func_name(func.start_ea) or "UnknownHandler"
+    script = generate_windbg_script(0x22000001, func_name, "WRITE_WHAT_WHERE", 9)
     idaapi.msg(f"[WinDbg Script]\n{script}\n")
 
 def analyze_ioctl_flow():
