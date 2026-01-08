@@ -51,109 +51,648 @@ def is_exploitable_method_neither(method, pseudo):
     
     return bool(user_buf_pattern.search(pseudo))
 
-# -------------------------------------------------
-# Scoped Symbolic-Lite: SOURCES → SINKS ONLY
-# (Only track if taint reaches real exploit primitive)
-# -------------------------------------------------
+# =============================================================================
+# TAINT-HEURISTIC ENGINE v2.0
+# Role-aware, direction-aware, state-machine based
+# =============================================================================
 
-# SOURCES: Where user data enters
-SOURCE_PATTERNS = {
-    'irp_user_buffer': re.compile(r'Irp->UserBuffer|Irp->AssociatedIrp\.SystemBuffer', re.I),
+# TAINT SOURCES: Where user data enters kernel
+TAINT_SOURCES = {
+    # Direct user pointers (METHOD_NEITHER)
     'type3_input': re.compile(r'Type3InputBuffer', re.I),
-    'input_length': re.compile(r'InputBufferLength|IoControlCode.*length', re.I),
+    'user_buffer': re.compile(r'Irp->UserBuffer', re.I),
+    # Buffered I/O (less dangerous but track)
+    'system_buffer': re.compile(r'Irp->AssociatedIrp\.SystemBuffer|SystemBuffer', re.I),
+    # Size sources (critical for overflow)
+    'input_length': re.compile(r'InputBufferLength', re.I),
+    'output_length': re.compile(r'OutputBufferLength', re.I),
+    # Generic parameters
+    'ioctl_params': re.compile(r'Parameters\.DeviceIoControl', re.I),
 }
 
-# SINKS: Where tainted data causes exploits
-SINK_PATTERNS = {
-    'memcpy': re.compile(r'\bmemcpy\s*\(|\bRtlCopyMemory\s*\(', re.I),
-    'rtl_copy': re.compile(r'\bRtlMoveMemory\s*\(|\bRtlCopyBytes\s*\(', re.I),
-    'mmmove': re.compile(r'\bmemmove\s*\(', re.I),
-    'pool_alloc': re.compile(r'\bExAllocatePool\w*\s*\(.*[,\)]', re.I),
-    'pointer_deref': re.compile(r'\*\s*\(.*tainted|tainted.*\*\s*\(', re.I),
-    'function_ptr': re.compile(r'(\w+)\s*=.*\(.*\*.*\(', re.I),
+# TAINT ROLES: What the tainted data is used for
+class TaintRole:
+    PTR_DST = 'ptr_dst'      # Destination pointer (write-what-where)
+    PTR_SRC = 'ptr_src'      # Source pointer (info leak)
+    SIZE = 'size'            # Length/size (overflow)
+    FUNC_PTR = 'func_ptr'    # Function pointer (code exec)
+    INDEX = 'index'          # Array index (OOB)
+    HANDLE = 'handle'        # Handle value (handle table attacks)
+    UNKNOWN = 'unknown'
+
+# MEMCPY-LIKE FUNCTIONS: Direction matters!
+MEMCPY_FUNCTIONS = {
+    # function: (dst_arg_pos, src_arg_pos, size_arg_pos)
+    'memcpy': (0, 1, 2),
+    'RtlCopyMemory': (0, 1, 2),
+    'RtlMoveMemory': (0, 1, 2),
+    'memmove': (0, 1, 2),
+    'RtlCopyBytes': (0, 1, 2),
+    'memset': (0, -1, 2),  # -1 = no src, value instead
+    'RtlZeroMemory': (0, -1, 1),
+    'RtlFillMemory': (0, -1, 1),
 }
+
+# POOL ALLOCATION FUNCTIONS
+POOL_ALLOC_FUNCS = [
+    'ExAllocatePool', 'ExAllocatePoolWithTag', 'ExAllocatePoolWithQuota',
+    'ExAllocatePoolWithQuotaTag', 'ExAllocatePool2', 'ExAllocatePool3',
+]
+
+# DANGEROUS SINKS by category
+SINK_CATEGORIES = {
+    'arbitrary_write': [
+        r'\*\s*\([^)]*\)\s*=',           # *(ptr) = val
+        r'\*[a-zA-Z_]\w*\s*=',            # *ptr = val
+        r'\[[^]]*\]\s*=',                  # arr[idx] = val
+    ],
+    'arbitrary_read': [
+        r'=\s*\*\s*\([^)]*\)',            # val = *(ptr)
+        r'=\s*\*[a-zA-Z_]\w*[^(]',        # val = *ptr (not func call)
+        r'=\s*[^=]*\[[^]]*\]',            # val = arr[idx]
+    ],
+    'function_ptr': [
+        r'\(\s*\*\s*\w+\s*\)\s*\(',       # (*fptr)(...)
+        r'callback\s*=',                   # callback = ...
+        r'handler\s*=',                    # handler = ...
+        r'pfn\w*\s*=',                     # pfnXxx = ...
+    ],
+    'zw_apis': [
+        r'Zw\w+\s*\(',                     # Any Zw* API
+        r'Nt\w+\s*\(',                     # Any Nt* API
+    ],
+    'mm_apis': [
+        r'MmCopyVirtualMemory',
+        r'MmMapLockedPages',
+        r'MmProbeAndLockPages',
+    ],
+    'process_token': [
+        r'PsLookupProcessByProcessId',
+        r'PsReferencePrimaryToken',
+        r'SeAccessCheck',
+        r'ObReferenceObjectByHandle',
+    ],
+}
+
+def extract_variable_assignments(pseudo):
+    """
+    Extract variable assignments from pseudocode.
+    Returns dict: {var_name: assignment_source}
+    """
+    assignments = {}
+    # Pattern: varname = expression;
+    assign_pattern = re.compile(r'(\w+)\s*=\s*([^;]+);', re.M)
+    for match in assign_pattern.finditer(pseudo):
+        var_name = match.group(1).strip()
+        assignment = match.group(2).strip()
+        assignments[var_name] = assignment
+    return assignments
+
+def identify_tainted_variables(pseudo):
+    """
+    Identify which variables are tainted by user input.
+    Returns: {var_name: taint_source}
+    """
+    tainted = {}
+    assignments = extract_variable_assignments(pseudo)
+    
+    # First pass: direct taint from sources
+    for var_name, assignment in assignments.items():
+        for source_name, pattern in TAINT_SOURCES.items():
+            if pattern.search(assignment):
+                tainted[var_name] = source_name
+                break
+    
+    # Second pass: 1-hop taint propagation
+    # If a variable is assigned from a tainted variable, it's tainted too
+    changed = True
+    max_iterations = 5  # Prevent infinite loops
+    iterations = 0
+    while changed and iterations < max_iterations:
+        changed = False
+        iterations += 1
+        for var_name, assignment in assignments.items():
+            if var_name in tainted:
+                continue
+            for tainted_var in tainted:
+                if re.search(r'\b' + re.escape(tainted_var) + r'\b', assignment):
+                    tainted[var_name] = f'propagated_from_{tainted_var}'
+                    changed = True
+                    break
+    
+    return tainted
+
+def analyze_memcpy_direction(pseudo, tainted_vars):
+    """
+    Analyze memcpy-like calls to determine taint direction.
+    
+    Returns list of dicts:
+    {
+        'function': 'memcpy',
+        'dst_tainted': True/False,
+        'src_tainted': True/False,
+        'size_tainted': True/False,
+        'primitive': 'WRITE_WHAT_WHERE' | 'INFO_LEAK' | 'OVERFLOW' | None
+    }
+    """
+    results = []
+    
+    for func_name, (dst_pos, src_pos, size_pos) in MEMCPY_FUNCTIONS.items():
+        # Pattern to extract function call with arguments
+        # memcpy(dst, src, size) or RtlCopyMemory(dst, src, size)
+        pattern = re.compile(
+            rf'\b{func_name}\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^)]+)\s*\)',
+            re.I
+        )
+        
+        for match in pattern.finditer(pseudo):
+            args = [match.group(1).strip(), match.group(2).strip(), match.group(3).strip()]
+            
+            dst_expr = args[dst_pos] if dst_pos >= 0 and dst_pos < len(args) else ''
+            src_expr = args[src_pos] if src_pos >= 0 and src_pos < len(args) else ''
+            size_expr = args[size_pos] if size_pos >= 0 and size_pos < len(args) else ''
+            
+            # Check if each argument contains tainted variables
+            dst_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', dst_expr) for tv in tainted_vars)
+            src_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', src_expr) for tv in tainted_vars)
+            size_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', size_expr) for tv in tainted_vars)
+            
+            # Also check for direct source patterns in arguments
+            for pattern_val in TAINT_SOURCES.values():
+                if pattern_val.search(dst_expr):
+                    dst_tainted = True
+                if pattern_val.search(src_expr):
+                    src_tainted = True
+                if pattern_val.search(size_expr):
+                    size_tainted = True
+            
+            # Determine primitive based on what's tainted
+            primitive = None
+            if dst_tainted and size_tainted:
+                primitive = 'WRITE_WHAT_WHERE'  # Critical: arbitrary write
+            elif dst_tainted and not size_tainted:
+                primitive = 'CONTROLLED_WRITE_DST'  # Write to user-controlled dest
+            elif src_tainted and not dst_tainted:
+                primitive = 'INFO_LEAK'  # Reading from user-controlled source to kernel
+            elif size_tainted and not dst_tainted:
+                primitive = 'SIZE_OVERFLOW'  # Size-only control (buffer overflow)
+            elif dst_tainted or src_tainted or size_tainted:
+                primitive = 'PARTIAL_TAINT'
+            
+            results.append({
+                'function': func_name,
+                'dst_expr': dst_expr[:50],
+                'src_expr': src_expr[:50],
+                'size_expr': size_expr[:50],
+                'dst_tainted': dst_tainted,
+                'src_tainted': src_tainted,
+                'size_tainted': size_tainted,
+                'primitive': primitive,
+            })
+    
+    return results
+
+def analyze_pointer_operations(pseudo, tainted_vars):
+    """
+    Analyze pointer dereferences to identify arbitrary read/write.
+    
+    Returns list of dicts with taint role analysis.
+    """
+    results = []
+    
+    # Write pattern: *(expr) = value or *ptr = value
+    write_patterns = [
+        re.compile(r'\*\s*\(([^)]+)\)\s*=\s*([^;]+);'),  # *(ptr) = val;
+        re.compile(r'\*(\w+)\s*=\s*([^;]+);'),            # *ptr = val;
+    ]
+    
+    # Read pattern: value = *(expr) or value = *ptr
+    read_patterns = [
+        re.compile(r'(\w+)\s*=\s*\*\s*\(([^)]+)\)'),     # val = *(ptr);
+        re.compile(r'(\w+)\s*=\s*\*(\w+)'),               # val = *ptr;
+    ]
+    
+    for pattern in write_patterns:
+        for match in pattern.finditer(pseudo):
+            ptr_expr = match.group(1).strip()
+            val_expr = match.group(2).strip()
+            
+            ptr_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', ptr_expr) for tv in tainted_vars)
+            val_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', val_expr) for tv in tainted_vars)
+            
+            # Check for direct source patterns
+            for pattern_val in TAINT_SOURCES.values():
+                if pattern_val.search(ptr_expr):
+                    ptr_tainted = True
+                if pattern_val.search(val_expr):
+                    val_tainted = True
+            
+            if ptr_tainted or val_tainted:
+                primitive = None
+                if ptr_tainted and val_tainted:
+                    primitive = 'WRITE_WHAT_WHERE'  # Full control
+                elif ptr_tainted:
+                    primitive = 'CONTROLLED_WRITE_DST'  # Destination controlled
+                elif val_tainted:
+                    primitive = 'CONTROLLED_WRITE_VAL'  # Value controlled
+                
+                results.append({
+                    'type': 'WRITE',
+                    'ptr_expr': ptr_expr[:50],
+                    'val_expr': val_expr[:50],
+                    'ptr_tainted': ptr_tainted,
+                    'val_tainted': val_tainted,
+                    'primitive': primitive,
+                })
+    
+    for pattern in read_patterns:
+        for match in pattern.finditer(pseudo):
+            dst_var = match.group(1).strip()
+            src_expr = match.group(2).strip()
+            
+            src_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', src_expr) for tv in tainted_vars)
+            
+            for pattern_val in TAINT_SOURCES.values():
+                if pattern_val.search(src_expr):
+                    src_tainted = True
+            
+            if src_tainted:
+                results.append({
+                    'type': 'READ',
+                    'dst_var': dst_var,
+                    'src_expr': src_expr[:50],
+                    'src_tainted': src_tainted,
+                    'primitive': 'ARBITRARY_READ',
+                })
+    
+    return results
+
+def analyze_pool_allocations(pseudo, tainted_vars):
+    """
+    Analyze pool allocations for user-controlled size.
+    """
+    results = []
+    
+    for func in POOL_ALLOC_FUNCS:
+        # Pattern: ExAllocatePool*(PoolType, Size) or ExAllocatePool*(PoolType, Size, Tag)
+        pattern = re.compile(rf'\b{func}\w*\s*\(\s*([^,]+)\s*,\s*([^,)]+)', re.I)
+        
+        for match in pattern.finditer(pseudo):
+            pool_type = match.group(1).strip()
+            size_expr = match.group(2).strip()
+            
+            size_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', size_expr) for tv in tainted_vars)
+            
+            for pattern_val in TAINT_SOURCES.values():
+                if pattern_val.search(size_expr):
+                    size_tainted = True
+            
+            if size_tainted:
+                results.append({
+                    'function': func,
+                    'pool_type': pool_type[:30],
+                    'size_expr': size_expr[:50],
+                    'size_tainted': True,
+                    'primitive': 'POOL_OVERFLOW',
+                })
+    
+    return results
+
+def analyze_function_pointers(pseudo, tainted_vars):
+    """
+    Detect user data flowing to function pointers.
+    """
+    results = []
+    
+    # Pattern: (*func_ptr)(...) or callback = user_data
+    call_pattern = re.compile(r'\(\s*\*\s*(\w+)\s*\)\s*\(([^)]*)\)')
+    assign_pattern = re.compile(r'(callback|handler|pfn\w*|func\w*ptr)\s*=\s*([^;]+);', re.I)
+    
+    for match in call_pattern.finditer(pseudo):
+        ptr_var = match.group(1).strip()
+        args = match.group(2).strip()
+        
+        ptr_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', ptr_var) for tv in tainted_vars)
+        
+        if ptr_tainted:
+            results.append({
+                'type': 'INDIRECT_CALL',
+                'ptr_var': ptr_var,
+                'primitive': 'CODE_EXECUTION',
+            })
+    
+    for match in assign_pattern.finditer(pseudo):
+        ptr_var = match.group(1).strip()
+        assignment = match.group(2).strip()
+        
+        assign_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', assignment) for tv in tainted_vars)
+        
+        for pattern_val in TAINT_SOURCES.values():
+            if pattern_val.search(assignment):
+                assign_tainted = True
+        
+        if assign_tainted:
+            results.append({
+                'type': 'FUNC_PTR_ASSIGN',
+                'ptr_var': ptr_var,
+                'assignment': assignment[:50],
+                'primitive': 'CODE_EXECUTION',
+            })
+    
+    return results
+
+def detect_validation_presence(pseudo):
+    """
+    Detect if validation/probing functions are present.
+    Returns annotations (not score adjustments).
+    """
+    annotations = []
+    
+    validation_funcs = {
+        'ProbeForRead': 'ProbeForRead present',
+        'ProbeForWrite': 'ProbeForWrite present',
+        'MmProbeAndLockPages': 'MmProbeAndLockPages present',
+        'MmIsAddressValid': 'MmIsAddressValid present (weak validation)',
+        'try_except': 'SEH __try/__except present',
+        '__try': 'SEH __try block present',
+    }
+    
+    for func, annotation in validation_funcs.items():
+        if re.search(rf'\b{func}\b', pseudo, re.I):
+            annotations.append(annotation)
+    
+    if not annotations:
+        annotations.append('NO_VALIDATION: No ProbeFor*/MmProbe detected')
+    
+    return annotations
+
+def compute_taint_roles(pseudo, tainted_vars):
+    """
+    Compute which taint ROLES are present.
+    
+    Returns:
+    {
+        'ptr_dst': bool,     # Tainted destination pointer
+        'ptr_src': bool,     # Tainted source pointer
+        'size': bool,        # Tainted size/length
+        'func_ptr': bool,    # Tainted function pointer
+        'index': bool,       # Tainted array index
+    }
+    """
+    roles = {
+        'ptr_dst': False,
+        'ptr_src': False,
+        'size': False,
+        'func_ptr': False,
+        'index': False,
+    }
+    
+    memcpy_results = analyze_memcpy_direction(pseudo, tainted_vars)
+    for r in memcpy_results:
+        if r.get('dst_tainted'):
+            roles['ptr_dst'] = True
+        if r.get('src_tainted'):
+            roles['ptr_src'] = True
+        if r.get('size_tainted'):
+            roles['size'] = True
+    
+    ptr_results = analyze_pointer_operations(pseudo, tainted_vars)
+    for r in ptr_results:
+        if r.get('type') == 'WRITE' and r.get('ptr_tainted'):
+            roles['ptr_dst'] = True
+        if r.get('type') == 'READ' and r.get('src_tainted'):
+            roles['ptr_src'] = True
+    
+    pool_results = analyze_pool_allocations(pseudo, tainted_vars)
+    for r in pool_results:
+        if r.get('size_tainted'):
+            roles['size'] = True
+    
+    func_results = analyze_function_pointers(pseudo, tainted_vars)
+    if func_results:
+        roles['func_ptr'] = True
+    
+    # Check for tainted array indices
+    index_pattern = re.compile(r'\[\s*([^]]+)\s*\]')
+    for match in index_pattern.finditer(pseudo):
+        idx_expr = match.group(1).strip()
+        if any(re.search(r'\b' + re.escape(tv) + r'\b', idx_expr) for tv in tainted_vars):
+            roles['index'] = True
+            break
+    
+    return roles
+
+def determine_primary_primitive(roles, memcpy_results, ptr_results, pool_results, func_results):
+    """
+    Determine the primary exploitation primitive based on taint roles.
+    
+    Hierarchy (most to least severe):
+    1. CODE_EXECUTION (function pointer control)
+    2. WRITE_WHAT_WHERE (dst + size or dst + val controlled)
+    3. ARBITRARY_READ (src pointer controlled)
+    4. POOL_OVERFLOW (size controlled in allocation)
+    5. SIZE_OVERFLOW (size controlled in copy)
+    6. CONTROLLED_INDEX (array index controlled)
+    7. PARTIAL_TAINT (some taint but unclear primitive)
+    """
+    # Check for code execution first
+    if func_results:
+        return 'CODE_EXECUTION'
+    
+    # Check memcpy results for write-what-where
+    for r in memcpy_results:
+        if r.get('primitive') == 'WRITE_WHAT_WHERE':
+            return 'WRITE_WHAT_WHERE'
+    
+    # Check pointer operations
+    for r in ptr_results:
+        if r.get('primitive') == 'WRITE_WHAT_WHERE':
+            return 'WRITE_WHAT_WHERE'
+    
+    # Check for controlled destination write
+    for r in memcpy_results:
+        if r.get('primitive') == 'CONTROLLED_WRITE_DST':
+            return 'CONTROLLED_WRITE_DST'
+    
+    for r in ptr_results:
+        if r.get('primitive') in ['CONTROLLED_WRITE_DST', 'CONTROLLED_WRITE_VAL']:
+            return r.get('primitive')
+    
+    # Check for info leak
+    for r in memcpy_results:
+        if r.get('primitive') == 'INFO_LEAK':
+            return 'INFO_LEAK'
+    
+    for r in ptr_results:
+        if r.get('primitive') == 'ARBITRARY_READ':
+            return 'ARBITRARY_READ'
+    
+    # Check for pool overflow
+    if pool_results:
+        return 'POOL_OVERFLOW'
+    
+    # Check for size overflow
+    for r in memcpy_results:
+        if r.get('primitive') == 'SIZE_OVERFLOW':
+            return 'SIZE_OVERFLOW'
+    
+    # Check for controlled index
+    if roles.get('index'):
+        return 'CONTROLLED_INDEX'
+    
+    # Partial taint
+    if any(roles.values()):
+        return 'PARTIAL_TAINT'
+    
+    return None
+
+def track_taint_heuristic(pseudo, f_ea):
+    """
+    Main taint-heuristic analysis function.
+    
+    Role-aware, direction-aware taint tracking using pattern matching
+    on decompiled pseudocode.
+    
+    Returns comprehensive analysis result:
+    {
+        'primitive': str,           # Primary exploitation primitive
+        'taint_roles': dict,        # Which roles are tainted
+        'tainted_vars': list,       # List of tainted variable names
+        'memcpy_analysis': list,    # Direction-aware memcpy analysis
+        'ptr_analysis': list,       # Pointer operation analysis
+        'pool_analysis': list,      # Pool allocation analysis
+        'func_ptr_analysis': list,  # Function pointer analysis
+        'annotations': list,        # Validation/probe annotations
+        'confidence': str,          # HIGH/MEDIUM/LOW
+        'reason': str,              # Human-readable explanation
+    }
+    """
+    if not pseudo:
+        return {
+            'primitive': None,
+            'taint_roles': {'ptr_dst': False, 'ptr_src': False, 'size': False, 'func_ptr': False, 'index': False},
+            'tainted_vars': [],
+            'memcpy_analysis': [],
+            'ptr_analysis': [],
+            'pool_analysis': [],
+            'func_ptr_analysis': [],
+            'annotations': [],
+            'confidence': 'NONE',
+            'reason': 'No pseudocode available',
+        }
+    
+    # Step 1: Identify tainted variables
+    tainted_vars = identify_tainted_variables(pseudo)
+    
+    if not tainted_vars:
+        return {
+            'primitive': None,
+            'taint_roles': {'ptr_dst': False, 'ptr_src': False, 'size': False, 'func_ptr': False, 'index': False},
+            'tainted_vars': [],
+            'memcpy_analysis': [],
+            'ptr_analysis': [],
+            'pool_analysis': [],
+            'func_ptr_analysis': [],
+            'annotations': ['No user-controlled variables detected'],
+            'confidence': 'NONE',
+            'reason': 'No taint sources found in pseudocode',
+        }
+    
+    # Step 2: Analyze each sink type
+    memcpy_results = analyze_memcpy_direction(pseudo, tainted_vars)
+    ptr_results = analyze_pointer_operations(pseudo, tainted_vars)
+    pool_results = analyze_pool_allocations(pseudo, tainted_vars)
+    func_results = analyze_function_pointers(pseudo, tainted_vars)
+    
+    # Step 3: Compute taint roles
+    roles = compute_taint_roles(pseudo, tainted_vars)
+    
+    # Step 4: Determine primary primitive
+    primitive = determine_primary_primitive(roles, memcpy_results, ptr_results, pool_results, func_results)
+    
+    # Step 5: Get validation annotations
+    annotations = detect_validation_presence(pseudo)
+    
+    # Step 6: Determine confidence
+    if primitive in ['WRITE_WHAT_WHERE', 'CODE_EXECUTION']:
+        confidence = 'HIGH'
+    elif primitive in ['CONTROLLED_WRITE_DST', 'ARBITRARY_READ', 'POOL_OVERFLOW']:
+        confidence = 'MEDIUM'
+    elif primitive:
+        confidence = 'LOW'
+    else:
+        confidence = 'NONE'
+    
+    # Step 7: Build reason string
+    reason_parts = []
+    if roles['ptr_dst']:
+        reason_parts.append('dst_ptr tainted')
+    if roles['ptr_src']:
+        reason_parts.append('src_ptr tainted')
+    if roles['size']:
+        reason_parts.append('size tainted')
+    if roles['func_ptr']:
+        reason_parts.append('func_ptr tainted')
+    if roles['index']:
+        reason_parts.append('index tainted')
+    
+    reason = f"{primitive or 'NO_PRIMITIVE'}: {', '.join(reason_parts) if reason_parts else 'no tainted roles'}"
+    
+    return {
+        'primitive': primitive,
+        'taint_roles': roles,
+        'tainted_vars': list(tainted_vars.keys()),
+        'memcpy_analysis': memcpy_results,
+        'ptr_analysis': ptr_results,
+        'pool_analysis': pool_results,
+        'func_ptr_analysis': func_results,
+        'annotations': annotations,
+        'confidence': confidence,
+        'reason': reason,
+    }
 
 def track_taint_to_primitive(pseudo, f_ea):
     """
-    Scoped taint tracking: SOURCE → SINK only.
-    
-    Returns:
-    - 'taint_flow': Where taint reaches (None, SINK_API, POINTER_DEREF, POOL_ALLOC, FUNCTION_PTR)
-    - 'sink_apis': Dangerous APIs hit
-    - 'user_controlled': YES/NO
-    - 'reason': Why this is exploitable
+    Wrapper for backward compatibility.
+    Calls the new taint-heuristic engine.
     """
-    if not pseudo:
-        return {'taint_flow': None, 'sink_apis': [], 'user_controlled': False, 'reason': ''}
+    result = track_taint_heuristic(pseudo, f_ea)
     
-    # Check if user source is present
-    has_user_source = any(pattern.search(pseudo) for pattern in SOURCE_PATTERNS.values())
+    # Convert to legacy format
+    primitive = result.get('primitive')
+    taint_flow = primitive if primitive else None
     
-    if not has_user_source:
-        return {'taint_flow': None, 'sink_apis': [], 'user_controlled': False, 'reason': 'No user source found'}
+    # Build sink_apis list from analysis
+    sink_apis = []
+    for r in result.get('memcpy_analysis', []):
+        sink_apis.append(r.get('function', 'memcpy'))
+    for r in result.get('pool_analysis', []):
+        sink_apis.append(r.get('function', 'ExAllocatePool'))
+    if result.get('func_ptr_analysis'):
+        sink_apis.append('FunctionPointer')
     
-    # Check which sinks taint reaches
-    detected_sinks = []
-    taint_flow = None
-    reason = ''
+    user_controlled = any(result.get('taint_roles', {}).values())
     
-    # Check each sink type
-    if SINK_PATTERNS['memcpy'].search(pseudo):
-        detected_sinks.append('memcpy')
-        taint_flow = 'WRITE_WHAT_WHERE'
-        reason = 'memcpy with user buffer'
-    
-    if SINK_PATTERNS['rtl_copy'].search(pseudo):
-        detected_sinks.append('RtlMoveMemory')
-        if not taint_flow:
-            taint_flow = 'WRITE_WHAT_WHERE'
-        reason = 'RtlMoveMemory with user buffer'
-    
-    if SINK_PATTERNS['pool_alloc'].search(pseudo):
-        detected_sinks.append('ExAllocatePool')
-        if not taint_flow:
-            taint_flow = 'POOL_OVERFLOW'
-        if 'user' in pseudo.lower():
-            reason = 'Pool allocation with user-controlled size'
-    
-    if SINK_PATTERNS['pointer_deref'].search(pseudo):
-        detected_sinks.append('UserPointerDeref')
-        if not taint_flow:
-            taint_flow = 'ARBITRARY_READ'
-        reason = 'Direct dereference of user pointer'
-    
-    if SINK_PATTERNS['function_ptr'].search(pseudo):
-        detected_sinks.append('FunctionPointer')
-        if not taint_flow:
-            taint_flow = 'CODE_EXECUTION'
-        reason = 'User data assigned to function pointer'
-    
-    # Only return result if taint actually reaches a sink
-    if taint_flow:
-        return {
-            'taint_flow': taint_flow,
-            'sink_apis': detected_sinks,
-            'user_controlled': True,
-            'reason': reason
-        }
-    
-    # No sink reached → discard this path
     return {
-        'taint_flow': None,
-        'sink_apis': [],
-        'user_controlled': False,
-        'reason': 'User source present but no exploitation sink detected'
+        'taint_flow': taint_flow,
+        'sink_apis': sink_apis,
+        'user_controlled': user_controlled,
+        'reason': result.get('reason', ''),
+        # NEW: Extended fields
+        'taint_roles': result.get('taint_roles', {}),
+        'annotations': result.get('annotations', []),
+        'confidence': result.get('confidence', 'NONE'),
+        'primitive': primitive,
     }
 
 def track_ioctl_flow(pseudo, f_ea):
     """
     Legacy wrapper for compatibility.
-    Returns scoped taint analysis result.
+    Returns taint-heuristic analysis result.
     """
     try:
         result = track_taint_to_primitive(pseudo, f_ea)
         
-        # Ensure sink_apis is always a list
         sink_apis = result.get('sink_apis', [])
         if not isinstance(sink_apis, list):
             sink_apis = []
@@ -164,25 +703,56 @@ def track_ioctl_flow(pseudo, f_ea):
             'dangerous_sink': bool(sink_apis),
             'sink_apis': sink_apis,
             'taint_flow': result.get('taint_flow'),
-            'reason': result.get('reason', '')
+            'reason': result.get('reason', ''),
+            # NEW: Extended fields
+            'taint_roles': result.get('taint_roles', {}),
+            'annotations': result.get('annotations', []),
+            'confidence': result.get('confidence', 'NONE'),
+            'primitive': result.get('primitive'),
         }
     except Exception as e:
-        # Safe fallback if anything goes wrong
         return {
             'flow': 'UNKNOWN',
             'user_controlled': False,
             'dangerous_sink': False,
             'sink_apis': [],
             'taint_flow': None,
-            'reason': f'Flow tracking error: {str(e)}'
+            'reason': f'Taint-heuristic error: {str(e)}',
+            'taint_roles': {},
+            'annotations': [],
+            'confidence': 'NONE',
+            'primitive': None,
         }
 
 def tag_method_neither_risk(f_ea, pseudo):
     """
-    Stub function - not implemented yet.
-    Returns empty list to avoid NameError.
+    Tag METHOD_NEITHER specific risks using taint-heuristic analysis.
     """
-    return []
+    if not pseudo:
+        return []
+    
+    risks = []
+    result = track_taint_heuristic(pseudo, f_ea)
+    
+    roles = result.get('taint_roles', {})
+    
+    if roles.get('ptr_dst'):
+        risks.append('TAINTED_DST_PTR')
+    if roles.get('ptr_src'):
+        risks.append('TAINTED_SRC_PTR')
+    if roles.get('size'):
+        risks.append('TAINTED_SIZE')
+    if roles.get('func_ptr'):
+        risks.append('TAINTED_FUNC_PTR')
+    if roles.get('index'):
+        risks.append('TAINTED_INDEX')
+    
+    # Add validation status
+    annotations = result.get('annotations', [])
+    if any('NO_VALIDATION' in a for a in annotations):
+        risks.append('NO_VALIDATION')
+    
+    return risks
 
 def score_exploitability_primitive_first(dec, method, taint_result, findings):
     """
@@ -190,12 +760,16 @@ def score_exploitability_primitive_first(dec, method, taint_result, findings):
     
     Base: Method must be 3 (METHOD_NEITHER), else score = 0
     
-    Then add ONLY if conditions met:
-    +4 → user buffer dereferenced
-    +3 → memcpy/memory write sink
-    +2 → size fully user-controlled
-    +1 → no ProbeForRead/Write
-    +1 → reachable from default access
+    Role-aware scoring:
+    +4 → dst_ptr tainted (write-what-where potential)
+    +3 → func_ptr tainted (code execution)
+    +2 → size tainted (overflow)
+    +2 → src_ptr tainted (info leak)
+    +1 → index tainted (OOB access)
+    +1 → default access (FILE_ANY_ACCESS)
+    
+    Annotations for validation (not score):
+    - ProbeForRead/Write presence noted but doesn't affect score
     
     Only show >= 5 (eliminates noise)
     """
@@ -210,39 +784,52 @@ def score_exploitability_primitive_first(dec, method, taint_result, findings):
     
     score = 0
     reasons = []
+    annotations = []
     
-    # Base METHOD_NEITHER score (implicit in our filter, but quantify it)
-    # Scoring is relative to actual primitive reach
+    # Get taint roles from new engine
+    taint_roles = taint_result.get('taint_roles', {})
+    primitive = taint_result.get('primitive')
+    confidence = taint_result.get('confidence', 'NONE')
     
-    # +4: User buffer directly dereferenced
-    if 'ARBITRARY_READ' in str(taint_result.get('taint_flow', '')):
+    # Role-based scoring
+    if taint_roles.get('ptr_dst'):
         score += 4
-        reasons.append('Direct user pointer dereference (ARBITRARY_READ)')
+        reasons.append('dst_ptr tainted (write-what-where)')
     
-    # +3: memcpy or direct memory write sink
-    sink_apis = taint_result.get('sink_apis', [])
-    if not isinstance(sink_apis, list):
-        sink_apis = []
-    if any(api in sink_apis for api in ['memcpy', 'RtlMoveMemory', 'RtlCopyMemory']):
+    if taint_roles.get('func_ptr'):
         score += 3
-        reasons.append('memcpy/memory write sink detected')
+        reasons.append('func_ptr tainted (code execution)')
     
-    # +2: Pool allocation with user size
-    if 'POOL_OVERFLOW' in str(taint_result.get('taint_flow', '')):
+    if taint_roles.get('size'):
         score += 2
-        reasons.append('Pool allocation with user-controlled size')
+        reasons.append('size tainted (overflow)')
     
-    # +1: No ProbeForRead/Write
-    if 'ProbeForRead' not in str(taint_result.get('reason', '')) and \
-       'ProbeForWrite' not in str(taint_result.get('reason', '')):
-        if taint_result.get('user_controlled'):
-            score += 1
-            reasons.append('No ProbeForRead/Write validation')
+    if taint_roles.get('ptr_src'):
+        score += 2
+        reasons.append('src_ptr tainted (info leak)')
+    
+    if taint_roles.get('index'):
+        score += 1
+        reasons.append('index tainted (OOB)')
     
     # +1: Default access (FILE_ANY_ACCESS)
-    if dec.get('access', -1) == 0:
+    if isinstance(dec, dict) and dec.get('access', -1) == 0:
         score += 1
-        reasons.append('Reachable from default access level')
+        reasons.append('FILE_ANY_ACCESS')
+    
+    # Validation annotations (NOT score adjustments)
+    result_annotations = taint_result.get('annotations', [])
+    for ann in result_annotations:
+        if 'NO_VALIDATION' in ann:
+            annotations.append('⚠ No ProbeFor*/validation detected')
+        elif 'ProbeFor' in ann or 'MmProbe' in ann:
+            annotations.append(f'ℹ {ann}')
+    
+    # Boost for high-confidence primitives
+    if primitive in ['WRITE_WHAT_WHERE', 'CODE_EXECUTION'] and confidence == 'HIGH':
+        if score < 7:
+            score = 7  # Minimum HIGH for confirmed dangerous primitives
+        reasons.append(f'HIGH confidence {primitive}')
     
     # Determine severity
     if score >= 9:
@@ -254,9 +841,14 @@ def score_exploitability_primitive_first(dec, method, taint_result, findings):
     elif score >= 3:
         severity = 'LOW'
     else:
-        severity = 'REJECTED'  # Below threshold, discard
+        severity = 'REJECTED'
     
-    return score, severity, '; '.join(reasons) if reasons else 'METHOD_NEITHER with user buffer'
+    # Build final rationale
+    rationale_parts = reasons.copy()
+    if annotations:
+        rationale_parts.extend(annotations)
+    
+    return score, severity, '; '.join(rationale_parts) if rationale_parts else f'METHOD_NEITHER: {primitive or "no primitive"}'
 
 def score_exploitability(dec, method, flow, findings):
     """
