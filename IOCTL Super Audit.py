@@ -2481,7 +2481,8 @@ def generate_fuzz_for_ioctl():
     func = ida_funcs.get_func(ea)
     if not func:
         return
-    harness = generate_fuzz_harness(0x22000001, func.name, 0)
+    func_name = ida_funcs.get_func_name(func.start_ea) or "UnknownHandler"
+    harness = generate_fuzz_harness(0x22000001, func_name, 0)
     idaapi.msg(f"[Fuzz Harness]\n{harness}\n")
 
 def generate_windbg_for_ioctl():
