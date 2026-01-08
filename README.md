@@ -2,7 +2,7 @@
 
 An advanced IDA Pro plugin for auditing Windows kernel drivers for IOCTL (Input/Output Control) vulnerabilities. **Engineered for exploitation-focused security researchers and kernel exploit developers.**
 
-**Status**: ✅ Production-Ready | ✅ All IOCTLs Detected | ✅ Signed Integer Handling Fixed | ✅ IDA 7/8/9 Compatible
+**Status**: ✅ IDA 7/8/9 Compatible
 
 ---
 
@@ -769,3 +769,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## ⚠️ Disclaimer
 
 This tool is for research and security auditing purposes only. Use responsibly and in accordance with applicable laws and regulations.
+
