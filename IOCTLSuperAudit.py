@@ -177,7 +177,13 @@ def clear_analysis_caches():
 
 
 class BackgroundScanTask:
-    """Background scan task that runs without blocking IDA UI"""
+    """
+    Background scan task using IDA's execute_sync for thread-safe API calls.
+    
+    IDA Pro requires all API calls to be made from the main thread.
+    This class uses idaapi.execute_sync() to schedule scan execution
+    on the main thread while providing async-like interface via polling.
+    """
     
     def __init__(self, verbosity=0, min_ioctl=0, max_ioctl=0xFFFFFFFF, callback=None):
         self.verbosity = verbosity
@@ -189,26 +195,68 @@ class BackgroundScanTask:
         self.total = 0
         self.status = "Not started"
         self.results = None
-        self.thread = None
+        self._running = False
         self.start_time = None
         self.end_time = None
+        self._timer = None
     
     def start(self):
-        """Start the background scan"""
-        self.thread = threading.Thread(target=self._run_scan, daemon=True)
+        """Start the background scan using IDA's timer mechanism"""
         self.start_time = time.time()
-        self.status = "Running"
-        self.thread.start()
+        self.status = "Queued"
+        self._running = True
+        
+        # Use IDA's timer to run scan on main thread without blocking UI
+        # Timer runs on main thread, so IDA API calls are safe
+        def timer_callback():
+            if self.cancelled:
+                self._running = False
+                self.status = "Cancelled"
+                self.end_time = time.time()
+                if self.callback:
+                    self.callback(self)
+                return -1  # Stop timer
+            
+            # Run the scan (on main thread now)
+            self.status = "Running"
+            try:
+                self.results = scan_ioctls_and_audit_optimized(
+                    verbosity=self.verbosity,
+                    min_ioctl=self.min_ioctl,
+                    max_ioctl=self.max_ioctl,
+                    progress_callback=self._update_progress
+                )
+                self.status = "Completed"
+            except Exception as e:
+                self.status = f"Error: {str(e)}"
+                self.results = None
+            finally:
+                self._running = False
+                self.end_time = time.time()
+                if self.callback:
+                    self.callback(self)
+            
+            return -1  # Stop timer after scan completes
+        
+        # Register timer with 100ms delay to allow UI to update
+        self._timer = idaapi.register_timer(100, timer_callback)
+        
         return self
     
     def cancel(self):
         """Cancel the scan"""
         self.cancelled = True
-        self.status = "Cancelled"
+        self.status = "Cancelling..."
+        if self._timer is not None:
+            try:
+                idaapi.unregister_timer(self._timer)
+            except:
+                pass
+            self._timer = None
     
     def is_running(self):
         """Check if scan is still running"""
-        return self.thread is not None and self.thread.is_alive()
+        return self._running
     
     def get_progress(self):
         """Get scan progress (0-100)"""
@@ -223,30 +271,17 @@ class BackgroundScanTask:
         end = self.end_time if self.end_time else time.time()
         return end - self.start_time
     
-    def _run_scan(self):
-        """Internal scan execution"""
-        try:
-            self.results = scan_ioctls_and_audit_optimized(
-                verbosity=self.verbosity,
-                min_ioctl=self.min_ioctl,
-                max_ioctl=self.max_ioctl,
-                progress_callback=self._update_progress
-            )
-            self.status = "Completed"
-        except Exception as e:
-            self.status = f"Error: {str(e)}"
-            self.results = None
-        finally:
-            self.end_time = time.time()
-            if self.callback:
-                self.callback(self)
-    
     def _update_progress(self, current, total, status=""):
         """Progress callback"""
         self.progress = current
         self.total = total
         if status:
             self.status = status
+        # Allow UI to process events during long scan
+        try:
+            idaapi.request_refresh(idaapi.IWID_DISASMS)
+        except:
+            pass
 
 
 # Global background task reference
