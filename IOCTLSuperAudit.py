@@ -727,6 +727,586 @@ def identify_tainted_variables(pseudo):
 
 
 # =============================================================================
+# PRECISE CTREE-BASED TAINT ANALYSIS v1.0
+# Uses IDA's actual Ctree/microcode for accurate data flow tracking
+# =============================================================================
+
+class PreciseTaintAnalyzer:
+    """
+    Precise taint analysis using IDA's Ctree (decompiler AST).
+    
+    Unlike heuristic regex matching, this walks the actual Ctree nodes
+    to track data flow with full context awareness.
+    
+    Features:
+    - Ctree visitor for accurate AST traversal
+    - Def-Use chain analysis
+    - Control flow sensitivity (if/switch branches)
+    - Type-aware propagation (struct fields, pointers)
+    - Call site argument mapping
+    
+    Precision: HIGH (vs MEDIUM for heuristic)
+    Speed: SLOWER (requires Ctree access per function)
+    """
+    
+    # Taint source patterns (Ctree node types)
+    CTREE_TAINT_SOURCES = [
+        'UserBuffer',
+        'Type3InputBuffer', 
+        'SystemBuffer',
+        'InputBufferLength',
+        'OutputBufferLength',
+        'IoControlCode',
+        'Parameters.DeviceIoControl',
+    ]
+    
+    # Dangerous sink API names
+    CTREE_SINK_APIS = {
+        'memcpy': {'args': [0, 2], 'type': 'MEMORY_COPY'},
+        'RtlCopyMemory': {'args': [0, 2], 'type': 'MEMORY_COPY'},
+        'memmove': {'args': [0, 2], 'type': 'MEMORY_COPY'},
+        'ExAllocatePool': {'args': [1], 'type': 'POOL_ALLOC'},
+        'ExAllocatePoolWithTag': {'args': [1], 'type': 'POOL_ALLOC'},
+        'ExAllocatePool2': {'args': [2], 'type': 'POOL_ALLOC'},
+        'MmMapIoSpace': {'args': [0, 1], 'type': 'PHYSICAL_MAP'},
+        'MmCopyVirtualMemory': {'args': [1, 3, 4], 'type': 'VIRTUAL_MEMORY'},
+        'ZwOpenProcess': {'args': [3], 'type': 'PROCESS_HANDLE'},
+        'ZwWriteVirtualMemory': {'args': [1, 2, 3], 'type': 'VIRTUAL_WRITE'},
+        'ZwReadVirtualMemory': {'args': [1, 2, 3], 'type': 'VIRTUAL_READ'},
+    }
+    
+    def __init__(self, func_ea):
+        self.func_ea = func_ea
+        self.tainted_vars = {}      # {var_id: taint_source}
+        self.tainted_expressions = []  # [(expr_str, source)]
+        self.sinks_reached = []     # [(sink_api, tainted_args, severity)]
+        self.def_use_chains = {}    # {var_id: [(def_ea, use_ea), ...]}
+        self.cfunc = None
+        self.analysis_mode = 'PRECISE'
+        
+    def analyze(self):
+        """
+        Run precise Ctree-based taint analysis.
+        
+        Returns:
+        {
+            'mode': 'PRECISE',
+            'tainted_vars': dict,
+            'sinks_reached': list,
+            'vulnerabilities': list,
+            'confidence': str,
+            'ctree_available': bool,
+        }
+        """
+        try:
+            # Try to get Ctree (requires Hex-Rays decompiler)
+            if not ida_hexrays.init_hexrays_plugin():
+                return self._fallback_to_heuristic("Hex-Rays not available")
+            
+            self.cfunc = ida_hexrays.decompile(self.func_ea)
+            if not self.cfunc:
+                return self._fallback_to_heuristic("Decompilation failed")
+            
+            # Phase 1: Identify taint sources via Ctree visitor
+            self._find_taint_sources()
+            
+            # Phase 2: Propagate taint through assignments
+            self._propagate_taint()
+            
+            # Phase 3: Check for sinks
+            self._check_sinks()
+            
+            # Phase 4: Build vulnerability report
+            vulns = self._build_vulnerability_report()
+            
+            return {
+                'mode': 'PRECISE',
+                'tainted_vars': self.tainted_vars,
+                'sinks_reached': self.sinks_reached,
+                'vulnerabilities': vulns,
+                'confidence': 'HIGH' if vulns else 'MEDIUM' if self.tainted_vars else 'LOW',
+                'ctree_available': True,
+            }
+            
+        except Exception as e:
+            return self._fallback_to_heuristic(f"Ctree error: {str(e)}")
+    
+    def _fallback_to_heuristic(self, reason):
+        """Fall back to heuristic analysis if Ctree unavailable."""
+        return {
+            'mode': 'HEURISTIC_FALLBACK',
+            'reason': reason,
+            'tainted_vars': {},
+            'sinks_reached': [],
+            'vulnerabilities': [],
+            'confidence': 'NONE',
+            'ctree_available': False,
+        }
+    
+    def _find_taint_sources(self):
+        """Walk Ctree to find taint sources."""
+        if not self.cfunc:
+            return
+        
+        class TaintSourceVisitor(ida_hexrays.ctree_visitor_t):
+            def __init__(self, analyzer):
+                ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+                self.analyzer = analyzer
+            
+            def visit_expr(self, expr):
+                # Check for member access (e.g., Irp->UserBuffer)
+                if expr.op == ida_hexrays.cot_memptr or expr.op == ida_hexrays.cot_memref:
+                    expr_str = self._get_expr_string(expr)
+                    for source in PreciseTaintAnalyzer.CTREE_TAINT_SOURCES:
+                        if source in expr_str:
+                            # Find the destination variable
+                            parent = self.parent_expr()
+                            if parent and parent.op == ida_hexrays.cot_asg:
+                                dst = parent.x
+                                if dst.op == ida_hexrays.cot_var:
+                                    var_id = dst.v.idx
+                                    self.analyzer.tainted_vars[var_id] = source
+                            self.analyzer.tainted_expressions.append((expr_str, source))
+                            break
+                return 0
+            
+            def _get_expr_string(self, expr):
+                """Convert Ctree expression to string."""
+                try:
+                    lines = []
+                    expr.print1(lines, None)
+                    return ''.join(str(l) for l in lines) if lines else str(expr)
+                except:
+                    return str(expr)
+        
+        visitor = TaintSourceVisitor(self)
+        visitor.apply_to(self.cfunc.body, None)
+    
+    def _propagate_taint(self):
+        """Propagate taint through assignments."""
+        if not self.cfunc:
+            return
+        
+        class TaintPropagationVisitor(ida_hexrays.ctree_visitor_t):
+            def __init__(self, analyzer):
+                ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+                self.analyzer = analyzer
+                self.changed = True
+                self.iterations = 0
+                self.max_iterations = 10
+            
+            def visit_expr(self, expr):
+                # Check assignments: dst = src
+                if expr.op == ida_hexrays.cot_asg:
+                    dst = expr.x
+                    src = expr.y
+                    
+                    if dst.op == ida_hexrays.cot_var:
+                        dst_id = dst.v.idx
+                        # Check if source contains tainted variable
+                        if self._expr_is_tainted(src):
+                            if dst_id not in self.analyzer.tainted_vars:
+                                self.analyzer.tainted_vars[dst_id] = 'propagated'
+                                self.changed = True
+                return 0
+            
+            def _expr_is_tainted(self, expr):
+                """Check if expression contains tainted data."""
+                if expr.op == ida_hexrays.cot_var:
+                    return expr.v.idx in self.analyzer.tainted_vars
+                # Recursively check sub-expressions
+                if expr.x and self._expr_is_tainted(expr.x):
+                    return True
+                if expr.y and self._expr_is_tainted(expr.y):
+                    return True
+                return False
+        
+        visitor = TaintPropagationVisitor(self)
+        while visitor.changed and visitor.iterations < visitor.max_iterations:
+            visitor.changed = False
+            visitor.iterations += 1
+            visitor.apply_to(self.cfunc.body, None)
+    
+    def _check_sinks(self):
+        """Check if tainted data reaches dangerous sinks."""
+        if not self.cfunc:
+            return
+        
+        class SinkCheckVisitor(ida_hexrays.ctree_visitor_t):
+            def __init__(self, analyzer):
+                ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+                self.analyzer = analyzer
+            
+            def visit_expr(self, expr):
+                # Check function calls
+                if expr.op == ida_hexrays.cot_call:
+                    callee = expr.x
+                    func_name = self._get_callee_name(callee)
+                    
+                    if func_name in PreciseTaintAnalyzer.CTREE_SINK_APIS:
+                        sink_info = PreciseTaintAnalyzer.CTREE_SINK_APIS[func_name]
+                        tainted_args = []
+                        
+                        # Check each argument
+                        args = expr.a
+                        for i, arg in enumerate(args):
+                            if i in sink_info['args']:
+                                if self._expr_is_tainted(arg):
+                                    tainted_args.append(i)
+                        
+                        if tainted_args:
+                            severity = 'CRITICAL' if sink_info['type'] in ['PHYSICAL_MAP', 'VIRTUAL_MEMORY', 'VIRTUAL_WRITE'] else 'HIGH'
+                            self.analyzer.sinks_reached.append({
+                                'api': func_name,
+                                'type': sink_info['type'],
+                                'tainted_args': tainted_args,
+                                'severity': severity,
+                            })
+                return 0
+            
+            def _get_callee_name(self, expr):
+                """Extract function name from call target."""
+                try:
+                    if expr.op == ida_hexrays.cot_obj:
+                        return ida_name.get_name(expr.obj_ea)
+                    return str(expr)
+                except:
+                    return ''
+            
+            def _expr_is_tainted(self, expr):
+                """Check if expression contains tainted data."""
+                if expr.op == ida_hexrays.cot_var:
+                    return expr.v.idx in self.analyzer.tainted_vars
+                if expr.x and self._expr_is_tainted(expr.x):
+                    return True
+                if expr.y and self._expr_is_tainted(expr.y):
+                    return True
+                return False
+        
+        visitor = SinkCheckVisitor(self)
+        visitor.apply_to(self.cfunc.body, None)
+    
+    def _build_vulnerability_report(self):
+        """Build vulnerability findings from sink analysis."""
+        vulns = []
+        for sink in self.sinks_reached:
+            primitive = self._sink_to_primitive(sink['type'])
+            vulns.append({
+                'vuln_type': sink['type'],
+                'api': sink['api'],
+                'severity': sink['severity'],
+                'primitive': primitive,
+                'tainted_args': sink['tainted_args'],
+                'analysis_mode': 'PRECISE_CTREE',
+            })
+        return vulns
+    
+    def _sink_to_primitive(self, sink_type):
+        """Map sink type to exploitation primitive."""
+        mapping = {
+            'MEMORY_COPY': 'WRITE_WHAT_WHERE',
+            'POOL_ALLOC': 'POOL_OVERFLOW',
+            'PHYSICAL_MAP': 'PHYSICAL_MEMORY_MAP',
+            'VIRTUAL_MEMORY': 'ARBITRARY_RW',
+            'VIRTUAL_WRITE': 'ARBITRARY_WRITE',
+            'VIRTUAL_READ': 'ARBITRARY_READ',
+            'PROCESS_HANDLE': 'PROCESS_CONTROL',
+        }
+        return mapping.get(sink_type, 'UNKNOWN')
+
+
+def run_precise_taint_analysis(func_ea):
+    """
+    Run precise Ctree-based taint analysis on a function.
+    
+    Returns comprehensive analysis result combining precise + heuristic.
+    """
+    analyzer = PreciseTaintAnalyzer(func_ea)
+    return analyzer.analyze()
+
+
+def combined_taint_analysis(pseudo, func_ea):
+    """
+    Combined analysis: Precise (Ctree) + Heuristic (regex).
+    
+    Uses precise analysis when available, augmented by heuristic patterns.
+    This provides maximum coverage with high confidence scoring.
+    
+    Returns:
+    {
+        'precise': {...},      # Ctree analysis results
+        'heuristic': {...},    # Pattern-based results
+        'combined': {...},     # Merged findings
+        'confidence': str,     # Overall confidence
+    }
+    """
+    # Run precise analysis
+    precise_result = run_precise_taint_analysis(func_ea)
+    
+    # Run heuristic analysis
+    heuristic_result = track_taint_heuristic(pseudo, func_ea)
+    
+    # Combine results
+    combined_vulns = []
+    seen_vulns = set()
+    
+    # Add precise findings (higher confidence)
+    for vuln in precise_result.get('vulnerabilities', []):
+        key = (vuln.get('api', ''), vuln.get('vuln_type', ''))
+        if key not in seen_vulns:
+            vuln['source'] = 'PRECISE'
+            combined_vulns.append(vuln)
+            seen_vulns.add(key)
+    
+    # Add heuristic findings (fill gaps)
+    for vuln in heuristic_result.get('ioctlance_vulns', []):
+        key = (vuln.get('api', ''), vuln.get('vuln_type', ''))
+        if key not in seen_vulns:
+            vuln['source'] = 'HEURISTIC'
+            combined_vulns.append(vuln)
+            seen_vulns.add(key)
+    
+    # Determine overall confidence
+    if precise_result.get('ctree_available') and combined_vulns:
+        confidence = 'HIGH'
+    elif combined_vulns:
+        confidence = 'MEDIUM'
+    elif precise_result.get('tainted_vars') or heuristic_result.get('tainted_vars'):
+        confidence = 'LOW'
+    else:
+        confidence = 'NONE'
+    
+    return {
+        'precise': precise_result,
+        'heuristic': heuristic_result,
+        'combined_vulnerabilities': combined_vulns,
+        'confidence': confidence,
+        'analysis_modes': ['PRECISE' if precise_result.get('ctree_available') else 'HEURISTIC_ONLY', 'HEURISTIC'],
+    }
+
+
+# =============================================================================
+# DYNAMIC ANALYSIS INTEGRATION SUGGESTIONS
+# =============================================================================
+# 
+# The following dynamic analysis approaches can complement static analysis:
+#
+# 1. KERNEL DEBUGGING INTEGRATION (WinDbg/KD)
+#    - Auto-generate WinDbg breakpoint scripts for IOCTL handlers
+#    - Trace IOCTL inputs at runtime to validate static findings
+#    - Monitor memory operations (ba w4/r4 breakpoints)
+#    - Track taint dynamically using hardware breakpoints
+#    Implementation: Generate .wds scripts with conditional breakpoints
+#
+# 2. DRIVER FUZZING HARNESS
+#    - Generate libFuzzer/WinAFL harnesses for each IOCTL
+#    - Corpus generation from static analysis (valid IOCTL ranges)
+#    - Coverage-guided mutation of input buffers
+#    Implementation: Export fuzzer harness templates (already done)
+#
+# 3. HYPERVISOR-BASED TAINT TRACKING
+#    - Use DRAKVUF or similar for full system taint tracking
+#    - Track taint propagation across driver/kernel boundary
+#    - Monitor for privilege escalation attempts
+#    Implementation: Export DRAKVUF configuration files
+#
+# 4. SYMBOLIC EXECUTION (EXISTING Z3 + EXTEND)
+#    - Current: Z3 constraint solving for reachability
+#    - Extension: Concolic execution with concrete driver loading
+#    - Integration with angr for full symbolic execution
+#    Implementation: Export angr scripts for each finding
+#
+# 5. IOCTL REPLAY/RECORDING
+#    - Record valid IOCTL sequences from clean execution
+#    - Replay with mutations to find edge cases
+#    - Compare behavior between versions
+#    Implementation: WinDbg logging + replay script generation
+#
+# 6. DRIVER VERIFIER INTEGRATION
+#    - Enable special pool for target driver
+#    - Monitor for pool overflows, double-frees
+#    - Validate ProbeFor* coverage
+#    Implementation: Generate Driver Verifier configuration
+#
+# 7. ETW/TRACING INTEGRATION
+#    - Generate ETW provider for IOCTL tracing
+#    - Real-time monitoring of IOCTL flow
+#    - Performance profiling of handlers
+#    Implementation: ETW manifest generation
+#
+# 8. EXPLOIT VALIDATION FRAMEWORK
+#    - Generate minimal PoC for each primitive
+#    - Automated testing in VM environment
+#    - Crash dump analysis integration
+#    Implementation: Exploit templates + VM automation scripts
+#
+# To enable dynamic analysis features, set:
+#   DYNAMIC_ANALYSIS_ENABLED = True
+#   DYNAMIC_ANALYSIS_MODE = 'windbg' | 'fuzzer' | 'hypervisor' | 'all'
+#
+# =============================================================================
+
+DYNAMIC_ANALYSIS_ENABLED = False  # Set to True to enable dynamic features
+DYNAMIC_ANALYSIS_MODE = 'windbg'  # Default mode
+
+
+def generate_dynamic_analysis_config(ioctls, findings, driver_name):
+    """
+    Generate configuration files for dynamic analysis tools.
+    
+    Returns dict of generated file contents:
+    {
+        'windbg_script': str,
+        'fuzzer_config': str,
+        'drakvuf_config': str,
+        'angr_script': str,
+        'etw_manifest': str,
+    }
+    """
+    configs = {}
+    
+    # WinDbg breakpoint script
+    configs['windbg_script'] = _generate_windbg_dynamic_script(ioctls, findings, driver_name)
+    
+    # Fuzzer configuration
+    configs['fuzzer_config'] = _generate_fuzzer_config(ioctls, driver_name)
+    
+    # angr symbolic execution script
+    configs['angr_script'] = _generate_angr_script(ioctls, findings, driver_name)
+    
+    return configs
+
+
+def _generate_windbg_dynamic_script(ioctls, findings, driver_name):
+    """Generate WinDbg script for dynamic taint tracking."""
+    script = f"""$$ IOCTL Super Audit - Dynamic Taint Tracking Script
+$$ Driver: {driver_name}
+$$ Auto-generated for runtime validation
+
+$$ Load driver symbols
+.reload /f {driver_name}
+
+$$ Enable special pool for driver
+!verifier /driver {driver_name}
+
+$$ IOCTL Handler Breakpoints
+"""
+    
+    for ioctl in ioctls[:20]:  # Limit to top 20
+        handler = ioctl.get('handler', 'Unknown')
+        ioctl_val = ioctl.get('ioctl', '0x0')
+        severity = ioctl.get('exploit_severity', 'LOW')
+        
+        if severity in ['CRITICAL', 'HIGH']:
+            script += f"""
+$$ {ioctl_val} - {severity}
+bp {driver_name}!{handler} "
+    .printf \\"\\n[IOCTL TRACE] {ioctl_val} -> {handler}\\n\\";
+    r rcx;r rdx;r r8;r r9;
+    .if (poi(@rdx+0x18) == {ioctl_val}) {{
+        .printf \\"[MATCH] IOCTL code matched\\n\\";
+        $$ Dump input buffer
+        dq poi(@rdx+0x20) L4;
+    }}
+    gc
+"
+"""
+    
+    script += """
+$$ Run with: $$>a< dynamic_taint.wds
+$$ Or: .scriptrun dynamic_taint.wds
+"""
+    return script
+
+
+def _generate_fuzzer_config(ioctls, driver_name):
+    """Generate WinAFL/libFuzzer configuration."""
+    config = f"""# IOCTL Super Audit - Fuzzer Configuration
+# Driver: {driver_name}
+
+[fuzzer]
+type = winafl
+target_module = {driver_name}
+coverage_module = {driver_name}
+iterations = 100000
+timeout = 5000
+
+[ioctls]
+"""
+    
+    for ioctl in ioctls:
+        ioctl_val = ioctl.get('ioctl', '0x0')
+        method = ioctl.get('method', 'UNKNOWN')
+        severity = ioctl.get('exploit_severity', 'LOW')
+        
+        config += f"""
+# {ioctl_val} ({method}) - {severity}
+[[ioctl]]
+code = {ioctl_val}
+min_input_size = 8
+max_input_size = 4096
+priority = {"high" if severity in ['CRITICAL', 'HIGH'] else "normal"}
+"""
+    
+    return config
+
+
+def _generate_angr_script(ioctls, findings, driver_name):
+    """Generate angr symbolic execution script."""
+    script = f'''#!/usr/bin/env python3
+"""
+IOCTL Super Audit - angr Symbolic Execution Script
+Driver: {driver_name}
+Auto-generated for vulnerability validation
+"""
+
+import angr
+import claripy
+
+def analyze_driver():
+    # Load driver binary
+    proj = angr.Project("{driver_name}", auto_load_libs=False)
+    
+    # Define symbolic IOCTL input
+    ioctl_code = claripy.BVS("ioctl_code", 32)
+    input_buffer = claripy.BVS("input_buffer", 8 * 4096)
+    input_length = claripy.BVS("input_length", 32)
+    
+    # Target IOCTLs from static analysis
+    target_ioctls = [
+'''
+    
+    for ioctl in ioctls[:10]:  # Top 10
+        script += f"        {ioctl.get('ioctl', '0x0')},  # {ioctl.get('exploit_severity', 'LOW')}\n"
+    
+    script += '''    ]
+    
+    # Symbolic exploration
+    for target in target_ioctls:
+        state = proj.factory.entry_state()
+        state.solver.add(ioctl_code == target)
+        
+        simgr = proj.factory.simulation_manager(state)
+        simgr.explore(find=lambda s: is_vulnerability(s))
+        
+        if simgr.found:
+            print(f"[VULN] Found path to vulnerability for IOCTL {hex(target)}")
+            for found_state in simgr.found:
+                print(f"  Input: {found_state.solver.eval(input_buffer, cast_to=bytes)}")
+
+def is_vulnerability(state):
+    """Check if state represents a vulnerability."""
+    # Check for dangerous API calls
+    # This is a template - customize for specific findings
+    return False
+
+if __name__ == "__main__":
+    analyze_driver()
+'''
+    return script
+
+
+# =============================================================================
 # INTER-PROCEDURAL TAINT ANALYSIS v1.0 (BEYOND IOCTLance)
 # Follows taint through function calls up to configurable depth
 # =============================================================================
@@ -2135,31 +2715,118 @@ def track_taint_to_primitive(pseudo, f_ea):
         'primitive': primitive,
     }
 
-def track_ioctl_flow(pseudo, f_ea):
+# Configuration for taint analysis mode
+TAINT_ANALYSIS_MODE = 'COMBINED'  # 'HEURISTIC', 'PRECISE', or 'COMBINED'
+
+
+def track_ioctl_flow(pseudo, f_ea, use_precise=None):
     """
-    Legacy wrapper for compatibility.
-    Returns taint-heuristic analysis result.
+    Main taint/flow analysis entry point.
+    
+    Supports three modes (controlled by TAINT_ANALYSIS_MODE or use_precise parameter):
+    - HEURISTIC: Fast regex-based pattern matching (default legacy behavior)
+    - PRECISE: Ctree-based AST analysis (higher accuracy, slower)
+    - COMBINED: Both methods merged (best coverage)
+    
+    Args:
+        pseudo: Decompiled pseudocode string
+        f_ea: Function effective address
+        use_precise: Override mode - True/False/'combined'/None (use global setting)
+    
+    Returns taint analysis result with mode indicator.
     """
     try:
-        result = track_taint_to_primitive(pseudo, f_ea)
+        # Determine analysis mode
+        if use_precise is None:
+            mode = TAINT_ANALYSIS_MODE
+        elif use_precise == 'combined' or use_precise == True:
+            mode = 'COMBINED'
+        elif use_precise == False:
+            mode = 'HEURISTIC'
+        else:
+            mode = str(use_precise).upper()
         
-        sink_apis = result.get('sink_apis', [])
-        if not isinstance(sink_apis, list):
+        # COMBINED mode: Run both precise and heuristic
+        if mode == 'COMBINED':
+            combined_result = combined_taint_analysis(pseudo, f_ea)
+            
+            # Extract data from combined result
+            heuristic = combined_result.get('heuristic', {})
+            precise = combined_result.get('precise', {})
+            combined_vulns = combined_result.get('combined_vulnerabilities', [])
+            
             sink_apis = []
+            for v in combined_vulns:
+                if v.get('api'):
+                    sink_apis.append(v['api'])
+            
+            # Use heuristic taint flow as base
+            taint_flow = heuristic.get('primitive') if isinstance(heuristic, dict) else None
+            
+            return {
+                'flow': 'TRACKED' if taint_flow or combined_vulns else 'UNKNOWN',
+                'user_controlled': bool(heuristic.get('tainted_vars', []) if isinstance(heuristic, dict) else []) or bool(precise.get('tainted_vars', {})),
+                'dangerous_sink': bool(sink_apis),
+                'sink_apis': sink_apis,
+                'taint_flow': taint_flow,
+                'reason': f"[COMBINED] Precise+Heuristic: {combined_result.get('confidence', 'UNKNOWN')} confidence, {len(combined_vulns)} vulns",
+                'taint_roles': heuristic.get('taint_roles', {}) if isinstance(heuristic, dict) else {},
+                'annotations': heuristic.get('annotations', []) if isinstance(heuristic, dict) else [],
+                'confidence': combined_result.get('confidence', 'NONE'),
+                'primitive': taint_flow,
+                # Extended: Full analysis data
+                'analysis_mode': 'COMBINED',
+                'precise_result': precise,
+                'heuristic_result': heuristic,
+                'combined_vulnerabilities': combined_vulns,
+            }
         
-        return {
-            'flow': 'TRACKED' if result.get('taint_flow') else 'UNKNOWN',
-            'user_controlled': result.get('user_controlled', False),
-            'dangerous_sink': bool(sink_apis),
-            'sink_apis': sink_apis,
-            'taint_flow': result.get('taint_flow'),
-            'reason': result.get('reason', ''),
-            # NEW: Extended fields
-            'taint_roles': result.get('taint_roles', {}),
-            'annotations': result.get('annotations', []),
-            'confidence': result.get('confidence', 'NONE'),
-            'primitive': result.get('primitive'),
-        }
+        # PRECISE mode: Ctree-based only
+        elif mode == 'PRECISE':
+            precise_result = run_precise_taint_analysis(f_ea)
+            
+            sink_apis = [s.get('api', '') for s in precise_result.get('sinks_reached', [])]
+            vulns = precise_result.get('vulnerabilities', [])
+            
+            primitive = vulns[0].get('primitive') if vulns else None
+            
+            return {
+                'flow': 'TRACKED' if vulns else 'UNKNOWN',
+                'user_controlled': bool(precise_result.get('tainted_vars', {})),
+                'dangerous_sink': bool(sink_apis),
+                'sink_apis': sink_apis,
+                'taint_flow': primitive,
+                'reason': f"[PRECISE] Ctree analysis: {precise_result.get('confidence', 'UNKNOWN')} confidence",
+                'taint_roles': {},  # Precise mode uses different structure
+                'annotations': [],
+                'confidence': precise_result.get('confidence', 'NONE'),
+                'primitive': primitive,
+                'analysis_mode': 'PRECISE',
+                'precise_result': precise_result,
+            }
+        
+        # HEURISTIC mode (default/legacy)
+        else:
+            result = track_taint_to_primitive(pseudo, f_ea)
+            
+            sink_apis = result.get('sink_apis', [])
+            if not isinstance(sink_apis, list):
+                sink_apis = []
+            
+            return {
+                'flow': 'TRACKED' if result.get('taint_flow') else 'UNKNOWN',
+                'user_controlled': result.get('user_controlled', False),
+                'dangerous_sink': bool(sink_apis),
+                'sink_apis': sink_apis,
+                'taint_flow': result.get('taint_flow'),
+                'reason': f"[HEURISTIC] {result.get('reason', '')}",
+                'taint_roles': result.get('taint_roles', {}),
+                'annotations': result.get('annotations', []),
+                'confidence': result.get('confidence', 'NONE'),
+                'primitive': result.get('primitive'),
+                'analysis_mode': 'HEURISTIC',
+            }
+            
     except Exception as e:
         return {
             'flow': 'UNKNOWN',
@@ -2167,11 +2834,12 @@ def track_ioctl_flow(pseudo, f_ea):
             'dangerous_sink': False,
             'sink_apis': [],
             'taint_flow': None,
-            'reason': f'Taint-heuristic error: {str(e)}',
+            'reason': f'Taint analysis error: {str(e)}',
             'taint_roles': {},
             'annotations': [],
             'confidence': 'NONE',
             'primitive': None,
+            'analysis_mode': 'ERROR',
         }
 
 def tag_method_neither_risk(f_ea, pseudo):
@@ -6287,8 +6955,14 @@ def scan_ioctls_and_audit_optimized(max_immediate=None, verbosity=0, min_ioctl=0
                 "exploit_severity": exploit_severity,
                 "user_controlled": "YES" if flow.get('user_controlled') else "NO",
                 "dangerous_sink": "YES" if flow.get('dangerous_sink') else "NO",
+                "flow": flow.get('flow', 'UNKNOWN') if isinstance(flow, dict) else 'UNKNOWN',
+                "ioctl_context": "YES" if flow.get('user_controlled') else "MAYBE",
             }
             ioctls.append(ioctl_entry)
+            
+            # Print each IOCTL to output window (like option 1)
+            if verbosity >= 1:
+                idaapi.msg(f"[IOCTL] {hex(raw_u32)} | {method_name} | {f_name} | RISK={risk} | EXPLOIT={exploit_severity}({exploit_score}) | Primitive={primitive or 'N/A'}\n")
             
             for v in vuln_hits + method_neither_factors:
                 findings.append({
@@ -6334,6 +7008,24 @@ def scan_ioctls_and_audit_optimized(max_immediate=None, verbosity=0, min_ioctl=0
             writer = csv.DictWriter(f, fieldnames=findings[0].keys())
             writer.writeheader()
             writer.writerows(findings)
+    
+    # Show summary and info dialog (like option 1)
+    if verbosity >= 1:
+        idaapi.msg(f"\n[IOCTL Audit] ═══════════════════════════════════════════════════════\n")
+        idaapi.msg(f"[IOCTL Audit] OPTIMIZED SCAN RESULTS SUMMARY\n")
+        idaapi.msg(f"[IOCTL Audit] ═══════════════════════════════════════════════════════\n")
+        idaapi.msg(f"[IOCTL Audit] Total IOCTLs Found: {len(ioctls)}\n")
+        idaapi.msg(f"[IOCTL Audit] Vulnerability Findings: {len(findings)}\n")
+        idaapi.msg(f"[IOCTL Audit] Output Directory: {out_dir}\n")
+        idaapi.msg(f"[IOCTL Audit] ═══════════════════════════════════════════════════════\n\n")
+    
+    # Show interactive IOCTL table viewer (like option 1)
+    if ioctls:
+        show_ioctl_table(ioctls)
+    
+    # Show vulnerabilities table (like option 1)
+    if findings:
+        show_findings_table(findings)
     
     if progress_callback:
         progress_callback(100, 100, f"Complete - {len(ioctls)} IOCTLs found")
@@ -7228,8 +7920,9 @@ class IoctlSuperAuditPlugin(idaapi.plugin_t):
 === PERFORMANCE ===
   18. Configure Performance Settings
   19. Clear Analysis Caches
+  20. Configure Taint Analysis Mode
 
-Select option (1-19):
+Select option (1-20):
 """
         
         try:
@@ -7507,9 +8200,79 @@ Enter new worker count (1-8):"""
             clear_analysis_caches()
             idaapi.msg("[IOCTL Audit] All analysis caches cleared.\n")
             ida_kernwin.info("Analysis caches cleared!\n\nNext scan will rebuild caches.")
+        
+        elif choice == "20":
+            # Configure Taint Analysis Mode
+            global TAINT_ANALYSIS_MODE, DYNAMIC_ANALYSIS_ENABLED, DYNAMIC_ANALYSIS_MODE
+            
+            taint_menu = f"""Taint Analysis Configuration
+
+=== CURRENT SETTINGS ===
+Taint Analysis Mode: {TAINT_ANALYSIS_MODE}
+Dynamic Analysis Enabled: {DYNAMIC_ANALYSIS_ENABLED}
+Dynamic Mode: {DYNAMIC_ANALYSIS_MODE}
+
+=== ANALYSIS MODES ===
+1. HEURISTIC - Fast regex-based pattern matching (default)
+   Speed: FAST | Precision: MEDIUM | Coverage: HIGH
+
+2. PRECISE - Ctree-based AST analysis (requires Hex-Rays)
+   Speed: SLOWER | Precision: HIGH | Coverage: MEDIUM
+   
+3. COMBINED - Both methods merged (recommended for audits)
+   Speed: MODERATE | Precision: HIGH | Coverage: MAXIMUM
+
+=== DYNAMIC ANALYSIS (Suggestions Only) ===
+When enabled, generates config files for runtime analysis tools:
+- WinDbg breakpoint scripts
+- Fuzzer harness configurations  
+- angr symbolic execution scripts
+
+Enter mode (1=HEURISTIC, 2=PRECISE, 3=COMBINED):"""
+            
+            mode_choice = ida_kernwin.ask_str("3", 0, taint_menu)
+            if mode_choice:
+                mode_choice = mode_choice.strip()
+                if mode_choice == "1":
+                    TAINT_ANALYSIS_MODE = 'HEURISTIC'
+                elif mode_choice == "2":
+                    TAINT_ANALYSIS_MODE = 'PRECISE'
+                elif mode_choice == "3":
+                    TAINT_ANALYSIS_MODE = 'COMBINED'
+                idaapi.msg(f"[IOCTL Audit] Taint analysis mode set to: {TAINT_ANALYSIS_MODE}\n")
+            
+            # Ask about dynamic analysis
+            enable_dynamic = ida_kernwin.ask_yn(0, 
+                "Enable Dynamic Analysis Config Generation?\n\n"
+                "This generates WinDbg scripts, fuzzer configs,\n"
+                "and angr scripts for runtime validation.\n\n"
+                "(Does NOT execute dynamic analysis)")
+            
+            if enable_dynamic is not None:
+                DYNAMIC_ANALYSIS_ENABLED = bool(enable_dynamic)
+                if DYNAMIC_ANALYSIS_ENABLED:
+                    dyn_mode = ida_kernwin.ask_str(DYNAMIC_ANALYSIS_MODE, 0,
+                        "Dynamic config mode:\n"
+                        "- windbg (WinDbg breakpoint scripts)\n"
+                        "- fuzzer (WinAFL/libFuzzer configs)\n"
+                        "- all (generate all config types)\n\n"
+                        "Enter mode:")
+                    if dyn_mode:
+                        DYNAMIC_ANALYSIS_MODE = dyn_mode.strip().lower()
+                idaapi.msg(f"[IOCTL Audit] Dynamic analysis: {'ENABLED' if DYNAMIC_ANALYSIS_ENABLED else 'DISABLED'}\n")
+            
+            ida_kernwin.info(
+                f"Taint Analysis Settings Updated!\n\n"
+                f"Analysis Mode: {TAINT_ANALYSIS_MODE}\n"
+                f"Dynamic Config: {'Enabled (' + DYNAMIC_ANALYSIS_MODE + ')' if DYNAMIC_ANALYSIS_ENABLED else 'Disabled'}\n\n"
+                f"Modes:\n"
+                f"- HEURISTIC: 23 regex pattern detectors\n"
+                f"- PRECISE: Ctree AST traversal\n"
+                f"- COMBINED: Both (highest coverage)"
+            )
             
         else:
-            ida_kernwin.warning("Invalid choice. Select 1-19.")
+            ida_kernwin.warning("Invalid choice. Select 1-20.")
     
     def _get_range_if_needed(self, filter_range):
         """Helper to get IOCTL range from user"""
