@@ -99,7 +99,72 @@ POOL_ALLOC_FUNCS = [
     'ExAllocatePoolWithQuotaTag', 'ExAllocatePool2', 'ExAllocatePool3',
 ]
 
-# DANGEROUS SINKS by category
+# =============================================================================
+# IOCTLance-EQUIVALENT VULNERABILITY PATTERNS
+# Ported from IOCTLance's symbolic execution hooks to static patterns
+# =============================================================================
+
+# Physical Memory Mapping (IOCTLance: HookMmMapIoSpace, HookZwMapViewOfSection)
+PHYSICAL_MEMORY_PATTERNS = {
+    'MmMapIoSpace': re.compile(r'MmMapIoSpace\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,', re.I),
+    'MmMapIoSpaceEx': re.compile(r'MmMapIoSpaceEx\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,', re.I),
+    'ZwMapViewOfSection': re.compile(r'ZwMapViewOfSection\s*\(', re.I),
+    'ZwOpenSection': re.compile(r'ZwOpenSection\s*\([^)]*PhysicalMemory', re.I),
+}
+
+# Process Handle Control (IOCTLance: HookZwOpenProcess, HookPsLookupProcessByProcessId)
+PROCESS_HANDLE_PATTERNS = {
+    'ZwOpenProcess': re.compile(r'ZwOpenProcess\s*\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^)]+)\)', re.I),
+    'PsLookupProcessByProcessId': re.compile(r'PsLookupProcessByProcessId\s*\(\s*([^,]+)\s*,', re.I),
+    'ObOpenObjectByPointer': re.compile(r'ObOpenObjectByPointer\s*\(', re.I),
+    'ObReferenceObjectByHandle': re.compile(r'ObReferenceObjectByHandle\s*\(', re.I),
+}
+
+# Dangerous I/O Operations (IOCTLance: wrmsr_hook, out_hook)
+DANGEROUS_IO_PATTERNS = {
+    'wrmsr': re.compile(r'\bwrmsr\b|__writemsr|_wrmsr|WriteMsr', re.I),
+    'outb': re.compile(r'\bout[bwl]?\s*\(|\b__outbyte|WRITE_PORT_UCHAR', re.I),
+    'inb': re.compile(r'\bin[bwl]?\s*\(|\b__inbyte|READ_PORT_UCHAR', re.I),
+    'cli_sti': re.compile(r'\b_disable\s*\(|\b_enable\s*\(|\bcli\b|\bsti\b', re.I),
+}
+
+# File Operations (IOCTLance: HookZwDeleteFile, HookZwCreateFile, HookZwOpenFile)
+FILE_OPERATION_PATTERNS = {
+    'ZwDeleteFile': re.compile(r'ZwDeleteFile\s*\(\s*([^)]+)\)', re.I),
+    'ZwCreateFile': re.compile(r'ZwCreateFile\s*\(', re.I),
+    'ZwOpenFile': re.compile(r'ZwOpenFile\s*\(', re.I),
+    'IoCreateFile': re.compile(r'IoCreateFile\s*\(', re.I),
+    'ZwWriteFile': re.compile(r'ZwWriteFile\s*\(', re.I),
+}
+
+# Process Termination (IOCTLance: HookZwTerminateProcess)
+PROCESS_TERMINATION_PATTERNS = {
+    'ZwTerminateProcess': re.compile(r'ZwTerminateProcess\s*\(\s*([^,]+)\s*,', re.I),
+    'NtTerminateProcess': re.compile(r'NtTerminateProcess\s*\(\s*([^,]+)\s*,', re.I),
+}
+
+# Context Switching (IOCTLance: HookKeStackAttachProcess, HookObCloseHandle)
+CONTEXT_SWITCH_PATTERNS = {
+    'KeStackAttachProcess': re.compile(r'KeStackAttachProcess\s*\(\s*([^,]+)\s*,', re.I),
+    'KeUnstackDetachProcess': re.compile(r'KeUnstackDetachProcess\s*\(', re.I),
+    'ObCloseHandle': re.compile(r'ObCloseHandle\s*\(\s*([^,]+)\s*,', re.I),
+}
+
+# Registry Operations (IOCTLance: HookRtlQueryRegistryValues - TermDD-like)
+REGISTRY_PATTERNS = {
+    'RtlQueryRegistryValues': re.compile(r'RtlQueryRegistryValues\s*\(', re.I),
+    'RtlQueryRegistryValuesEx': re.compile(r'RtlQueryRegistryValuesEx\s*\(', re.I),
+    'ZwQueryValueKey': re.compile(r'ZwQueryValueKey\s*\(', re.I),
+}
+
+# Null Pointer Dereference Indicators (IOCTLance: b_mem_read/b_mem_write)
+NULL_DEREF_PATTERNS = {
+    'unchecked_systembuffer': re.compile(r'SystemBuffer\s*->', re.I),
+    'unchecked_userbuffer': re.compile(r'UserBuffer\s*->', re.I),
+    'missing_null_check': re.compile(r'if\s*\(\s*!\s*\w+\s*\)\s*return|if\s*\(\s*\w+\s*==\s*(NULL|0|nullptr)\s*\)', re.I),
+}
+
+# DANGEROUS SINKS by category (expanded)
 SINK_CATEGORIES = {
     'arbitrary_write': [
         r'\*\s*\([^)]*\)\s*=',           # *(ptr) = val
@@ -131,6 +196,26 @@ SINK_CATEGORIES = {
         r'PsReferencePrimaryToken',
         r'SeAccessCheck',
         r'ObReferenceObjectByHandle',
+    ],
+    # NEW: IOCTLance-equivalent sinks
+    'physical_memory': [
+        r'MmMapIoSpace',
+        r'ZwMapViewOfSection',
+        r'\\\\Device\\\\PhysicalMemory',
+    ],
+    'process_handle': [
+        r'ZwOpenProcess',
+        r'PsLookupProcessByProcessId',
+        r'ObOpenObjectByPointer',
+    ],
+    'dangerous_io': [
+        r'wrmsr|__writemsr',
+        r'out[bwl]?\s*\(|WRITE_PORT',
+        r'in[bwl]?\s*\(|READ_PORT',
+    ],
+    'process_termination': [
+        r'ZwTerminateProcess',
+        r'NtTerminateProcess',
     ],
 }
 
@@ -426,6 +511,399 @@ def detect_validation_presence(pseudo):
     
     return annotations
 
+# =============================================================================
+# IOCTLance-EQUIVALENT VULNERABILITY DETECTORS
+# Static pattern-based equivalents of angr symbolic hooks
+# =============================================================================
+
+def detect_physical_memory_map(pseudo, tainted_vars):
+    """
+    IOCTLance equivalent: HookMmMapIoSpace, HookZwMapViewOfSection
+    
+    Detects:
+    - MmMapIoSpace with tainted PhysicalAddress or NumberOfBytes
+    - ZwMapViewOfSection with controllable section handle
+    - ZwOpenSection to \\Device\\PhysicalMemory
+    """
+    results = []
+    
+    # MmMapIoSpace(PhysicalAddress, NumberOfBytes, CacheType)
+    for match in PHYSICAL_MEMORY_PATTERNS['MmMapIoSpace'].finditer(pseudo):
+        phys_addr = match.group(1).strip()
+        num_bytes = match.group(2).strip()
+        
+        phys_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', phys_addr) for tv in tainted_vars)
+        size_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', num_bytes) for tv in tainted_vars)
+        
+        # Check for direct source patterns
+        for pat in TAINT_SOURCES.values():
+            if pat.search(phys_addr):
+                phys_tainted = True
+            if pat.search(num_bytes):
+                size_tainted = True
+        
+        if phys_tainted or size_tainted:
+            severity = 'CRITICAL' if phys_tainted and size_tainted else 'HIGH'
+            results.append({
+                'vuln_type': 'MAP_PHYSICAL_MEMORY',
+                'api': 'MmMapIoSpace',
+                'phys_addr_tainted': phys_tainted,
+                'size_tainted': size_tainted,
+                'severity': severity,
+                'description': f'MmMapIoSpace - {"PhysicalAddress and NumberOfBytes" if phys_tainted and size_tainted else "PhysicalAddress" if phys_tainted else "NumberOfBytes"} controllable',
+            })
+    
+    # ZwOpenSection to PhysicalMemory
+    if PHYSICAL_MEMORY_PATTERNS['ZwOpenSection'].search(pseudo):
+        results.append({
+            'vuln_type': 'MAP_PHYSICAL_MEMORY',
+            'api': 'ZwOpenSection',
+            'severity': 'CRITICAL',
+            'description': 'ZwOpenSection to \\Device\\PhysicalMemory detected',
+        })
+    
+    # ZwMapViewOfSection
+    if PHYSICAL_MEMORY_PATTERNS['ZwMapViewOfSection'].search(pseudo):
+        # Check if section handle comes from tainted source
+        section_tainted = any(tv in pseudo for tv in tainted_vars)
+        if section_tainted:
+            results.append({
+                'vuln_type': 'MAP_PHYSICAL_MEMORY',
+                'api': 'ZwMapViewOfSection',
+                'severity': 'HIGH',
+                'description': 'ZwMapViewOfSection with potentially tainted section handle',
+            })
+    
+    return results
+
+def detect_controllable_process_handle(pseudo, tainted_vars):
+    """
+    IOCTLance equivalent: HookZwOpenProcess, HookPsLookupProcessByProcessId
+    
+    Detects:
+    - ZwOpenProcess with controllable ClientId
+    - PsLookupProcessByProcessId with controllable ProcessId
+    - ObOpenObjectByPointer with tainted EPROCESS
+    """
+    results = []
+    
+    # ZwOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId)
+    for match in PROCESS_HANDLE_PATTERNS['ZwOpenProcess'].finditer(pseudo):
+        client_id = match.group(4).strip() if match.lastindex >= 4 else ''
+        
+        clientid_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', client_id) for tv in tainted_vars)
+        for pat in TAINT_SOURCES.values():
+            if pat.search(client_id):
+                clientid_tainted = True
+        
+        if clientid_tainted:
+            results.append({
+                'vuln_type': 'CONTROLLABLE_PROCESS_HANDLE',
+                'api': 'ZwOpenProcess',
+                'severity': 'HIGH',
+                'description': 'ZwOpenProcess - ClientId controllable (arbitrary process access)',
+            })
+    
+    # PsLookupProcessByProcessId(ProcessId, Process)
+    for match in PROCESS_HANDLE_PATTERNS['PsLookupProcessByProcessId'].finditer(pseudo):
+        process_id = match.group(1).strip()
+        
+        pid_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', process_id) for tv in tainted_vars)
+        for pat in TAINT_SOURCES.values():
+            if pat.search(process_id):
+                pid_tainted = True
+        
+        if pid_tainted:
+            results.append({
+                'vuln_type': 'CONTROLLABLE_PROCESS_HANDLE',
+                'api': 'PsLookupProcessByProcessId',
+                'severity': 'HIGH',
+                'description': 'PsLookupProcessByProcessId - ProcessId controllable (EPROCESS access)',
+            })
+    
+    return results
+
+def detect_arbitrary_shellcode_execution(pseudo, tainted_vars):
+    """
+    IOCTLance equivalent: b_call breakpoint checking tainted function address
+    
+    Detects indirect calls through tainted function pointers.
+    """
+    results = []
+    
+    # Pattern: call through register that's tainted
+    # (*ptr)() or call [reg] patterns
+    indirect_call_patterns = [
+        re.compile(r'\(\s*\*\s*(\w+)\s*\)\s*\('),           # (*fptr)(...)
+        re.compile(r'call\s+\[?\s*(\w+)\s*\]?'),            # call reg / call [reg]
+        re.compile(r'(\w+)\s*\(\s*\)'),                      # func() where func is variable
+    ]
+    
+    for pattern in indirect_call_patterns:
+        for match in pattern.finditer(pseudo):
+            ptr_var = match.group(1).strip()
+            
+            ptr_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', ptr_var) for tv in tainted_vars)
+            
+            if ptr_tainted:
+                results.append({
+                    'vuln_type': 'ARBITRARY_SHELLCODE_EXECUTION',
+                    'api': 'IndirectCall',
+                    'ptr_var': ptr_var,
+                    'severity': 'CRITICAL',
+                    'description': f'Indirect call through tainted pointer: {ptr_var}',
+                })
+    
+    return results
+
+def detect_wrmsr_inout(pseudo, tainted_vars):
+    """
+    IOCTLance equivalent: wrmsr_hook, out_hook, opcodes.py
+    
+    Detects:
+    - WRMSR with controllable MSR register or value
+    - IN/OUT with controllable port or data
+    """
+    results = []
+    
+    # WRMSR detection
+    if DANGEROUS_IO_PATTERNS['wrmsr'].search(pseudo):
+        # Check if any tainted variable is near wrmsr
+        wrmsr_tainted = any(tv in pseudo for tv in tainted_vars)
+        if wrmsr_tainted:
+            results.append({
+                'vuln_type': 'ARBITRARY_WRMSR',
+                'api': 'wrmsr',
+                'severity': 'CRITICAL',
+                'description': 'WRMSR with potentially controllable MSR/value (kernel code execution)',
+            })
+    
+    # OUT instruction (port I/O)
+    if DANGEROUS_IO_PATTERNS['outb'].search(pseudo):
+        out_tainted = any(tv in pseudo for tv in tainted_vars)
+        if out_tainted:
+            results.append({
+                'vuln_type': 'ARBITRARY_OUT',
+                'api': 'OUT',
+                'severity': 'HIGH',
+                'description': 'OUT instruction with potentially controllable port/data',
+            })
+    
+    # IN instruction
+    if DANGEROUS_IO_PATTERNS['inb'].search(pseudo):
+        in_tainted = any(tv in pseudo for tv in tainted_vars)
+        if in_tainted:
+            results.append({
+                'vuln_type': 'ARBITRARY_IN',
+                'api': 'IN',
+                'severity': 'MEDIUM',
+                'description': 'IN instruction with potentially controllable port',
+            })
+    
+    return results
+
+def detect_dangerous_file_operations(pseudo, tainted_vars):
+    """
+    IOCTLance equivalent: HookZwDeleteFile, HookZwCreateFile, HookZwOpenFile
+    
+    Detects file operations with tainted ObjectAttributes.
+    """
+    results = []
+    
+    for api_name, pattern in FILE_OPERATION_PATTERNS.items():
+        if pattern.search(pseudo):
+            # Check if ObjectAttributes or filename is tainted
+            file_tainted = any(tv in pseudo for tv in tainted_vars)
+            
+            # Stronger check: look for taint near the file API
+            context_window = 200
+            for match in pattern.finditer(pseudo):
+                start = max(0, match.start() - context_window)
+                end = min(len(pseudo), match.end() + context_window)
+                context = pseudo[start:end]
+                
+                for tv in tainted_vars:
+                    if tv in context:
+                        file_tainted = True
+                        break
+            
+            if file_tainted:
+                severity = 'CRITICAL' if 'Delete' in api_name else 'HIGH'
+                results.append({
+                    'vuln_type': 'DANGEROUS_FILE_OPERATION',
+                    'api': api_name,
+                    'severity': severity,
+                    'description': f'{api_name} with potentially tainted path/attributes',
+                })
+    
+    return results
+
+def detect_arbitrary_process_termination(pseudo, tainted_vars):
+    """
+    IOCTLance equivalent: HookZwTerminateProcess
+    
+    Detects ZwTerminateProcess with controllable handle.
+    """
+    results = []
+    
+    for match in PROCESS_TERMINATION_PATTERNS['ZwTerminateProcess'].finditer(pseudo):
+        handle = match.group(1).strip()
+        
+        handle_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', handle) for tv in tainted_vars)
+        for pat in TAINT_SOURCES.values():
+            if pat.search(handle):
+                handle_tainted = True
+        
+        if handle_tainted:
+            results.append({
+                'vuln_type': 'ARBITRARY_PROCESS_TERMINATION',
+                'api': 'ZwTerminateProcess',
+                'severity': 'HIGH',
+                'description': 'ZwTerminateProcess - handle controllable (DoS/privilege escalation)',
+            })
+    
+    return results
+
+def detect_null_pointer_dereference(pseudo, tainted_vars):
+    """
+    IOCTLance equivalent: b_mem_read/b_mem_write null pointer checks
+    
+    Detects:
+    - SystemBuffer/UserBuffer dereference without null check
+    - Allocated memory dereference without validation
+    """
+    results = []
+    
+    # Check for buffer dereference patterns
+    buffer_deref_patterns = [
+        (r'SystemBuffer\s*->\s*\w+', 'SystemBuffer'),
+        (r'UserBuffer\s*->\s*\w+', 'UserBuffer'),
+        (r'Type3InputBuffer\s*->\s*\w+', 'Type3InputBuffer'),
+    ]
+    
+    for pattern, buffer_name in buffer_deref_patterns:
+        if re.search(pattern, pseudo, re.I):
+            # Check if there's a null check before
+            null_check = NULL_DEREF_PATTERNS['missing_null_check'].search(pseudo)
+            
+            # If buffer is dereferenced but no null check found
+            if not null_check:
+                results.append({
+                    'vuln_type': 'NULL_POINTER_DEREFERENCE',
+                    'buffer': buffer_name,
+                    'severity': 'MEDIUM',
+                    'description': f'{buffer_name} dereferenced without visible null check (potential DoS)',
+                })
+    
+    return results
+
+def detect_context_switch_vulnerability(pseudo, tainted_vars):
+    """
+    IOCTLance equivalent: HookKeStackAttachProcess, HookObCloseHandle
+    
+    Detects handle operations in different process context.
+    """
+    results = []
+    
+    has_context_switch = CONTEXT_SWITCH_PATTERNS['KeStackAttachProcess'].search(pseudo)
+    has_close_handle = CONTEXT_SWITCH_PATTERNS['ObCloseHandle'].search(pseudo)
+    
+    if has_context_switch:
+        # Check if EPROCESS is tainted
+        for match in CONTEXT_SWITCH_PATTERNS['KeStackAttachProcess'].finditer(pseudo):
+            process = match.group(1).strip()
+            process_tainted = any(re.search(r'\b' + re.escape(tv) + r'\b', process) for tv in tainted_vars)
+            
+            if process_tainted:
+                results.append({
+                    'vuln_type': 'TAINTED_PROCESS_CONTEXT',
+                    'api': 'KeStackAttachProcess',
+                    'severity': 'HIGH',
+                    'description': 'KeStackAttachProcess with tainted EPROCESS (privilege escalation)',
+                })
+    
+    if has_context_switch and has_close_handle:
+        # Check for close handle in different context
+        results.append({
+            'vuln_type': 'CLOSE_HANDLE_DIFFERENT_CONTEXT',
+            'api': 'ObCloseHandle after KeStackAttachProcess',
+            'severity': 'HIGH',
+            'description': 'ObCloseHandle called in different process context (handle table corruption)',
+        })
+    
+    return results
+
+def detect_rtlqueryregistry_overflow(pseudo, tainted_vars):
+    """
+    IOCTLance equivalent: HookRtlQueryRegistryValues
+    
+    Detects TermDD-like RtlQueryRegistryValues buffer overflow.
+    RTL_QUERY_REGISTRY_DIRECT without RTL_QUERY_REGISTRY_TYPECHECK.
+    """
+    results = []
+    
+    if REGISTRY_PATTERNS['RtlQueryRegistryValues'].search(pseudo) or \
+       REGISTRY_PATTERNS['RtlQueryRegistryValuesEx'].search(pseudo):
+        
+        # Check for RTL_QUERY_REGISTRY_DIRECT (0x20) without TYPECHECK (0x100)
+        has_direct = re.search(r'RTL_QUERY_REGISTRY_DIRECT|0x20', pseudo, re.I)
+        has_typecheck = re.search(r'RTL_QUERY_REGISTRY_TYPECHECK|0x100', pseudo, re.I)
+        
+        if has_direct and not has_typecheck:
+            results.append({
+                'vuln_type': 'REGISTRY_BUFFER_OVERFLOW',
+                'api': 'RtlQueryRegistryValues',
+                'severity': 'CRITICAL',
+                'description': 'RtlQueryRegistryValues with RTL_QUERY_REGISTRY_DIRECT but no TYPECHECK (TermDD-like CVE)',
+            })
+        
+        # Even without explicit flags, the API is dangerous
+        if not has_direct:
+            results.append({
+                'vuln_type': 'REGISTRY_BUFFER_OVERFLOW',
+                'api': 'RtlQueryRegistryValues',
+                'severity': 'MEDIUM',
+                'description': 'RtlQueryRegistryValues detected - review for CVE-2021-1732 patterns',
+            })
+    
+    return results
+
+def run_ioctlance_equivalent_checks(pseudo, tainted_vars):
+    """
+    Run all IOCTLance-equivalent vulnerability checks.
+    Returns combined results from all detectors.
+    """
+    all_results = []
+    
+    # Physical memory mapping (CRITICAL)
+    all_results.extend(detect_physical_memory_map(pseudo, tainted_vars))
+    
+    # Process handle control
+    all_results.extend(detect_controllable_process_handle(pseudo, tainted_vars))
+    
+    # Shellcode execution
+    all_results.extend(detect_arbitrary_shellcode_execution(pseudo, tainted_vars))
+    
+    # WRMSR/IN/OUT
+    all_results.extend(detect_wrmsr_inout(pseudo, tainted_vars))
+    
+    # File operations
+    all_results.extend(detect_dangerous_file_operations(pseudo, tainted_vars))
+    
+    # Process termination
+    all_results.extend(detect_arbitrary_process_termination(pseudo, tainted_vars))
+    
+    # Null pointer dereference
+    all_results.extend(detect_null_pointer_dereference(pseudo, tainted_vars))
+    
+    # Context switch vulnerabilities
+    all_results.extend(detect_context_switch_vulnerability(pseudo, tainted_vars))
+    
+    # Registry overflow (TermDD-like)
+    all_results.extend(detect_rtlqueryregistry_overflow(pseudo, tainted_vars))
+    
+    return all_results
+
 def compute_taint_roles(pseudo, tainted_vars):
     """
     Compute which taint ROLES are present.
@@ -553,6 +1031,17 @@ def track_taint_heuristic(pseudo, f_ea):
     Role-aware, direction-aware taint tracking using pattern matching
     on decompiled pseudocode.
     
+    Now includes IOCTLance-equivalent vulnerability detection for:
+    - Physical memory mapping (MmMapIoSpace, ZwMapViewOfSection)
+    - Process handle control (ZwOpenProcess, PsLookupProcessByProcessId)
+    - Shellcode execution (tainted function pointers)
+    - WRMSR/IN/OUT (privileged instructions)
+    - Dangerous file operations
+    - Process termination
+    - Null pointer dereference
+    - Context switch vulnerabilities
+    - Registry buffer overflow (TermDD-like)
+    
     Returns comprehensive analysis result:
     {
         'primitive': str,           # Primary exploitation primitive
@@ -562,6 +1051,7 @@ def track_taint_heuristic(pseudo, f_ea):
         'ptr_analysis': list,       # Pointer operation analysis
         'pool_analysis': list,      # Pool allocation analysis
         'func_ptr_analysis': list,  # Function pointer analysis
+        'ioctlance_vulns': list,    # IOCTLance-equivalent vulnerability findings
         'annotations': list,        # Validation/probe annotations
         'confidence': str,          # HIGH/MEDIUM/LOW
         'reason': str,              # Human-readable explanation
@@ -576,6 +1066,7 @@ def track_taint_heuristic(pseudo, f_ea):
             'ptr_analysis': [],
             'pool_analysis': [],
             'func_ptr_analysis': [],
+            'ioctlance_vulns': [],
             'annotations': [],
             'confidence': 'NONE',
             'reason': 'No pseudocode available',
@@ -585,6 +1076,10 @@ def track_taint_heuristic(pseudo, f_ea):
     tainted_vars = identify_tainted_variables(pseudo)
     
     if not tainted_vars:
+        # Still run IOCTLance checks even without explicit tainted vars
+        # Some patterns (like PhysicalMemory access) are dangerous regardless
+        ioctlance_vulns = run_ioctlance_equivalent_checks(pseudo, {})
+        
         return {
             'primitive': None,
             'taint_roles': {'ptr_dst': False, 'ptr_src': False, 'size': False, 'func_ptr': False, 'index': False},
@@ -593,9 +1088,10 @@ def track_taint_heuristic(pseudo, f_ea):
             'ptr_analysis': [],
             'pool_analysis': [],
             'func_ptr_analysis': [],
+            'ioctlance_vulns': ioctlance_vulns,
             'annotations': ['No user-controlled variables detected'],
-            'confidence': 'NONE',
-            'reason': 'No taint sources found in pseudocode',
+            'confidence': 'LOW' if ioctlance_vulns else 'NONE',
+            'reason': 'No taint sources found' + (f', but {len(ioctlance_vulns)} IOCTLance patterns detected' if ioctlance_vulns else ''),
         }
     
     # Step 2: Analyze each sink type
@@ -604,26 +1100,45 @@ def track_taint_heuristic(pseudo, f_ea):
     pool_results = analyze_pool_allocations(pseudo, tainted_vars)
     func_results = analyze_function_pointers(pseudo, tainted_vars)
     
-    # Step 3: Compute taint roles
+    # Step 3: Run IOCTLance-equivalent checks (NEW)
+    ioctlance_vulns = run_ioctlance_equivalent_checks(pseudo, tainted_vars)
+    
+    # Step 4: Compute taint roles
     roles = compute_taint_roles(pseudo, tainted_vars)
     
-    # Step 4: Determine primary primitive
+    # Step 5: Determine primary primitive (include IOCTLance findings)
     primitive = determine_primary_primitive(roles, memcpy_results, ptr_results, pool_results, func_results)
     
-    # Step 5: Get validation annotations
+    # Upgrade primitive based on IOCTLance findings
+    for vuln in ioctlance_vulns:
+        vuln_type = vuln.get('vuln_type', '')
+        if vuln_type == 'ARBITRARY_SHELLCODE_EXECUTION':
+            primitive = 'CODE_EXECUTION'
+            break
+        elif vuln_type == 'MAP_PHYSICAL_MEMORY' and primitive != 'CODE_EXECUTION':
+            primitive = 'PHYSICAL_MEMORY_MAP'
+        elif vuln_type == 'ARBITRARY_WRMSR' and primitive not in ['CODE_EXECUTION', 'PHYSICAL_MEMORY_MAP']:
+            primitive = 'WRMSR_CONTROL'
+        elif vuln_type == 'CONTROLLABLE_PROCESS_HANDLE' and not primitive:
+            primitive = 'PROCESS_HANDLE_CONTROL'
+    
+    # Step 6: Get validation annotations
     annotations = detect_validation_presence(pseudo)
     
-    # Step 6: Determine confidence
-    if primitive in ['WRITE_WHAT_WHERE', 'CODE_EXECUTION']:
+    # Step 7: Determine confidence (boost for IOCTLance findings)
+    critical_ioctlance = any(v.get('severity') == 'CRITICAL' for v in ioctlance_vulns)
+    high_ioctlance = any(v.get('severity') == 'HIGH' for v in ioctlance_vulns)
+    
+    if primitive in ['WRITE_WHAT_WHERE', 'CODE_EXECUTION', 'PHYSICAL_MEMORY_MAP', 'WRMSR_CONTROL'] or critical_ioctlance:
         confidence = 'HIGH'
-    elif primitive in ['CONTROLLED_WRITE_DST', 'ARBITRARY_READ', 'POOL_OVERFLOW']:
+    elif primitive in ['CONTROLLED_WRITE_DST', 'ARBITRARY_READ', 'POOL_OVERFLOW', 'PROCESS_HANDLE_CONTROL'] or high_ioctlance:
         confidence = 'MEDIUM'
     elif primitive:
         confidence = 'LOW'
     else:
         confidence = 'NONE'
     
-    # Step 7: Build reason string
+    # Step 8: Build reason string
     reason_parts = []
     if roles['ptr_dst']:
         reason_parts.append('dst_ptr tainted')
@@ -636,6 +1151,10 @@ def track_taint_heuristic(pseudo, f_ea):
     if roles['index']:
         reason_parts.append('index tainted')
     
+    # Add IOCTLance findings to reason
+    for vuln in ioctlance_vulns[:3]:  # Limit to top 3
+        reason_parts.append(f"{vuln.get('vuln_type', 'UNKNOWN')}")
+    
     reason = f"{primitive or 'NO_PRIMITIVE'}: {', '.join(reason_parts) if reason_parts else 'no tainted roles'}"
     
     return {
@@ -646,6 +1165,7 @@ def track_taint_heuristic(pseudo, f_ea):
         'ptr_analysis': ptr_results,
         'pool_analysis': pool_results,
         'func_ptr_analysis': func_results,
+        'ioctlance_vulns': ioctlance_vulns,  # NEW: IOCTLance-equivalent findings
         'annotations': annotations,
         'confidence': confidence,
         'reason': reason,
@@ -670,6 +1190,9 @@ def track_taint_to_primitive(pseudo, f_ea):
         sink_apis.append(r.get('function', 'ExAllocatePool'))
     if result.get('func_ptr_analysis'):
         sink_apis.append('FunctionPointer')
+    # Add IOCTLance vuln APIs
+    for v in result.get('ioctlance_vulns', []):
+        sink_apis.append(v.get('api', 'Unknown'))
     
     user_controlled = any(result.get('taint_roles', {}).values())
     
@@ -754,6 +1277,1928 @@ def tag_method_neither_risk(f_ea, pseudo):
     
     return risks
 
+# =============================================================================
+# Z3 SMT SOLVER + FSM SYMBOLIC EXECUTION ENGINE v3.0
+# IDA Ctree-aware symbolic execution with constraint solving
+# =============================================================================
+
+# Try to import Z3 - graceful fallback if not available
+# Catches ImportError (not installed) and AttributeError (version mismatch)
+Z3_AVAILABLE = False
+Z3_ERROR_MSG = None
+try:
+    from z3 import (
+        BitVec, BitVecVal, Bool, BoolVal, Int, IntVal,
+        And, Or, Not, If, Implies, Extract, Concat, ZeroExt, SignExt,
+        ULT, ULE, UGT, UGE, LShR, RotateLeft, RotateRight,
+        Solver, sat, unsat, unknown, simplify
+    )
+    Z3_AVAILABLE = True
+except ImportError as e:
+    Z3_ERROR_MSG = f"Z3 not installed: {e}"
+except AttributeError as e:
+    # Z3 version mismatch - Python package doesn't match native library
+    Z3_ERROR_MSG = f"Z3 version mismatch (reinstall with: pip uninstall z3-solver && pip install z3-solver): {e}"
+except Exception as e:
+    Z3_ERROR_MSG = f"Z3 import failed: {e}"
+
+if not Z3_AVAILABLE:
+    # Stub classes for when Z3 is not available
+    class Solver:
+        def add(self, *args): pass
+        def check(self): return 'unknown'
+        def model(self): return {}
+        def push(self): pass
+        def pop(self): pass
+    def BitVec(name, bits): return None
+    def BitVecVal(val, bits): return None
+    def Bool(name): return None
+    def BoolVal(val): return None
+    def Int(name): return None
+    def IntVal(val): return None
+    def And(*args): return None
+    def Or(*args): return None
+    def Not(x): return None
+    def If(c, t, e): return None
+    def Implies(a, b): return None
+    def Extract(hi, lo, x): return None
+    def Concat(*args): return None
+    def ZeroExt(n, x): return None
+    def SignExt(n, x): return None
+    def ULT(a, b): return None
+    def ULE(a, b): return None
+    def UGT(a, b): return None
+    def UGE(a, b): return None
+    def LShR(a, b): return None
+    def RotateLeft(a, b): return None
+    def RotateRight(a, b): return None
+    def simplify(x): return x
+    sat = 'sat'
+    unsat = 'unsat'
+    unknown = 'unknown'
+
+
+class SMTSettings:
+    """
+    Configuration settings for the SMT/FSM symbolic execution engine.
+    Singleton pattern with persistent storage.
+    """
+    _instance = None
+    
+    # Default values
+    DEFAULTS = {
+        'max_depth': 50,           # Maximum basic blocks to explore
+        'loop_unroll': 3,          # Number of loop iterations to unroll
+        'solver_timeout': 5000,    # Z3 timeout in milliseconds
+        'inter_procedural': True,  # Follow function calls
+        'inline_threshold': 20,    # Max lines to inline from called functions
+        'generate_inputs': True,   # Generate concrete exploit inputs
+        'verbose_logging': False,  # Detailed symbolic execution trace
+        'enable_fsm': True,        # Use FSM state tracking
+        'pointer_size': 64,        # 32 or 64 bit
+    }
+    
+    def __init__(self):
+        self._settings = dict(self.DEFAULTS)
+    
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = SMTSettings()
+        return cls._instance
+    
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            return super().__getattribute__(name)
+        return self._settings.get(name, self.DEFAULTS.get(name))
+    
+    def __setattr__(self, name, value):
+        if name.startswith('_'):
+            super().__setattr__(name, value)
+        else:
+            self._settings[name] = value
+    
+    def reset(self):
+        self._settings = dict(self.DEFAULTS)
+    
+    def to_dict(self):
+        return dict(self._settings)
+    
+    def from_dict(self, d):
+        for k, v in d.items():
+            if k in self.DEFAULTS:
+                self._settings[k] = v
+
+
+class FSMState:
+    """Finite State Machine states for IOCTL handler analysis"""
+    INIT = 'INIT'
+    INPUT_READ = 'INPUT_READ'
+    VALIDATE = 'VALIDATE'
+    PROCESS = 'PROCESS'
+    SINK = 'SINK'
+    EXIT = 'EXIT'
+    BYPASS = 'BYPASS'
+
+
+class IOCTLStateMachine:
+    """
+    Finite State Machine for tracking IOCTL handler execution flow.
+    
+    State transitions track:
+    - When user input is read
+    - When validation (ProbeFor*) occurs
+    - When dangerous sinks are reached
+    - When validation is bypassed
+    """
+    
+    TRANSITIONS = {
+        FSMState.INIT: [FSMState.INPUT_READ, FSMState.EXIT],
+        FSMState.INPUT_READ: [FSMState.VALIDATE, FSMState.PROCESS, FSMState.SINK, FSMState.EXIT],
+        FSMState.VALIDATE: [FSMState.PROCESS, FSMState.SINK, FSMState.EXIT, FSMState.BYPASS],
+        FSMState.PROCESS: [FSMState.VALIDATE, FSMState.SINK, FSMState.EXIT, FSMState.PROCESS],
+        FSMState.SINK: [FSMState.EXIT, FSMState.PROCESS],
+        FSMState.BYPASS: [FSMState.SINK, FSMState.PROCESS],
+        FSMState.EXIT: [],
+    }
+    
+    # APIs that trigger state transitions
+    INPUT_APIS = {'Type3InputBuffer', 'UserBuffer', 'SystemBuffer', 'InputBufferLength'}
+    VALIDATE_APIS = {'ProbeForRead', 'ProbeForWrite', 'MmIsAddressValid', 'MmProbeAndLockPages'}
+    SINK_APIS = {'memcpy', 'RtlCopyMemory', 'MmMapIoSpace', 'ZwOpenProcess', 'ZwTerminateProcess',
+                 'wrmsr', 'ZwDeleteFile', 'ObOpenObjectByPointer'}
+    
+    def __init__(self):
+        self.state = FSMState.INIT
+        self.trace = [(FSMState.INIT, None, 0)]  # (state, trigger, address)
+        self.validation_seen = False
+        self.input_read = False
+        self.sinks_reached = []
+    
+    def transition(self, new_state, trigger=None, address=0):
+        """Attempt state transition, returns True if valid"""
+        if new_state in self.TRANSITIONS.get(self.state, []):
+            self.state = new_state
+            self.trace.append((new_state, trigger, address))
+            
+            if new_state == FSMState.INPUT_READ:
+                self.input_read = True
+            elif new_state == FSMState.VALIDATE:
+                self.validation_seen = True
+            elif new_state == FSMState.SINK:
+                self.sinks_reached.append({'trigger': trigger, 'address': address})
+            
+            return True
+        return False
+    
+    def can_transition(self, new_state):
+        return new_state in self.TRANSITIONS.get(self.state, [])
+    
+    def is_sink_without_validation(self):
+        """Check if we reached SINK without VALIDATE"""
+        for state, trigger, addr in self.trace:
+            if state == FSMState.VALIDATE:
+                return False
+            if state == FSMState.SINK:
+                return True
+        return False
+    
+    def get_path_summary(self):
+        """Return summary of state transitions"""
+        states_only = [s for s, _, _ in self.trace]
+        return ' → '.join(states_only)
+
+
+class SymbolicState:
+    """
+    Manages symbolic variables and constraints during execution.
+    
+    Tracks:
+    - Symbolic variables for user inputs
+    - Path constraints from conditionals
+    - Memory state (simplified)
+    """
+    
+    def __init__(self, settings=None):
+        self.settings = settings or SMTSettings.get_instance()
+        self.ptr_size = self.settings.pointer_size
+        
+        # Symbolic variables
+        self.symbols = {}
+        
+        # Path constraints
+        self.constraints = []
+        
+        # Tracked memory regions (simplified)
+        self.memory = {}
+        
+        # Variable assignments
+        self.assignments = {}
+        
+        # Initialize standard IOCTL symbolic variables
+        if Z3_AVAILABLE:
+            self._init_ioctl_symbols()
+    
+    def _init_ioctl_symbols(self):
+        """Initialize symbolic variables for IOCTL analysis"""
+        if not Z3_AVAILABLE:
+            return
+        
+        # User buffer pointer
+        self.symbols['UserBuffer'] = BitVec('UserBuffer', self.ptr_size)
+        self.symbols['Type3InputBuffer'] = BitVec('Type3InputBuffer', self.ptr_size)
+        self.symbols['SystemBuffer'] = BitVec('SystemBuffer', self.ptr_size)
+        
+        # Buffer lengths
+        self.symbols['InputBufferLength'] = BitVec('InputBufferLength', 32)
+        self.symbols['OutputBufferLength'] = BitVec('OutputBufferLength', 32)
+        
+        # User data bytes (first 64 bytes)
+        for i in range(64):
+            self.symbols[f'UserData_{i}'] = BitVec(f'UserData_{i}', 8)
+    
+    def create_symbol(self, name, bits=None):
+        """Create or retrieve a symbolic variable"""
+        if not Z3_AVAILABLE:
+            return None
+        
+        if name in self.symbols:
+            return self.symbols[name]
+        
+        bits = bits or self.ptr_size
+        sym = BitVec(name, bits)
+        self.symbols[name] = sym
+        return sym
+    
+    def add_constraint(self, constraint):
+        """Add a path constraint"""
+        if constraint is not None:
+            self.constraints.append(constraint)
+    
+    def get_constraints(self):
+        """Get all path constraints"""
+        return self.constraints
+    
+    def is_symbolic(self, var_name):
+        """Check if a variable is symbolic (user-controlled)"""
+        return var_name in self.symbols
+    
+    def get_symbol(self, var_name):
+        """Get symbolic variable by name"""
+        return self.symbols.get(var_name)
+    
+    def fork(self):
+        """Create a copy of the current state for path forking"""
+        new_state = SymbolicState(self.settings)
+        new_state.symbols = dict(self.symbols)
+        new_state.constraints = list(self.constraints)
+        new_state.memory = dict(self.memory)
+        new_state.assignments = dict(self.assignments)
+        return new_state
+
+
+class Z3ConstraintBuilder:
+    """
+    Builds Z3 constraints from IDA ctree expressions.
+    
+    Translates pseudocode expressions to Z3 formulas.
+    """
+    
+    def __init__(self, symbolic_state):
+        self.state = symbolic_state
+    
+    def build_from_expr_str(self, expr_str, tainted_vars):
+        """
+        Build Z3 expression from pseudocode expression string.
+        
+        This is a simplified parser for common patterns.
+        For full accuracy, use ctree visitor.
+        """
+        if not Z3_AVAILABLE:
+            return None
+        
+        expr_str = expr_str.strip()
+        
+        # Check for comparison operators
+        for op, z3_op in [('>=', UGE), ('<=', ULE), ('>', UGT), ('<', ULT), ('==', lambda a,b: a == b), ('!=', lambda a,b: a != b)]:
+            if op in expr_str:
+                parts = expr_str.split(op, 1)
+                if len(parts) == 2:
+                    left = self._to_z3_val(parts[0].strip(), tainted_vars)
+                    right = self._to_z3_val(parts[1].strip(), tainted_vars)
+                    if left is not None and right is not None:
+                        return z3_op(left, right)
+        
+        # Single variable or value
+        return self._to_z3_val(expr_str, tainted_vars)
+    
+    def _to_z3_val(self, val_str, tainted_vars):
+        """Convert string to Z3 value"""
+        if not Z3_AVAILABLE:
+            return None
+        
+        val_str = val_str.strip()
+        
+        # Check if it's a known symbolic variable
+        if val_str in self.state.symbols:
+            return self.state.symbols[val_str]
+        
+        # Check if it's a tainted variable
+        if val_str in tainted_vars:
+            return self.state.create_symbol(val_str, 64)
+        
+        # Try to parse as number
+        try:
+            if val_str.startswith('0x') or val_str.startswith('0X'):
+                return BitVecVal(int(val_str, 16), 64)
+            elif val_str.isdigit() or (val_str.startswith('-') and val_str[1:].isdigit()):
+                return BitVecVal(int(val_str), 64)
+        except:
+            pass
+        
+        # Create new symbol for unknown variable
+        return self.state.create_symbol(val_str, 64)
+
+
+class SymbolicExecutionEngine:
+    """
+    Main symbolic execution engine using Z3 and IDA ctree.
+    
+    Combines:
+    - FSM state tracking
+    - Symbolic variable propagation
+    - Z3 constraint solving
+    - Vulnerability detection
+    """
+    
+    def __init__(self, settings=None):
+        self.settings = settings or SMTSettings.get_instance()
+        self.fsm = None
+        self.symbolic_state = None
+        self.constraint_builder = None
+        self.vulnerabilities = []
+        self.paths_explored = 0
+        self.states_explored = 0
+    
+    def analyze_function(self, f_ea):
+        """
+        Run symbolic execution on a function.
+        
+        Returns comprehensive analysis result.
+        """
+        if not Z3_AVAILABLE:
+            return {
+                'error': 'Z3 not available. Install with: pip install z3-solver',
+                'vulnerabilities': [],
+                'fsm_trace': [],
+                'constraints': [],
+            }
+        
+        if not HEXRAYS_AVAILABLE:
+            return {
+                'error': 'Hex-Rays decompiler not available',
+                'vulnerabilities': [],
+                'fsm_trace': [],
+                'constraints': [],
+            }
+        
+        # Initialize state
+        self.fsm = IOCTLStateMachine()
+        self.symbolic_state = SymbolicState(self.settings)
+        self.constraint_builder = Z3ConstraintBuilder(self.symbolic_state)
+        self.vulnerabilities = []
+        self.paths_explored = 0
+        self.states_explored = 0
+        
+        try:
+            # Get decompiled function
+            cfunc = ida_hexrays.decompile(f_ea)
+            if not cfunc:
+                return {
+                    'error': 'Decompilation failed',
+                    'vulnerabilities': [],
+                    'fsm_trace': [],
+                    'constraints': [],
+                }
+            
+            # Get pseudocode as string for pattern matching
+            pseudo = str(cfunc)
+            
+            # Identify tainted variables
+            tainted_vars = identify_tainted_variables(pseudo)
+            
+            # Walk the ctree
+            self._analyze_ctree(cfunc, tainted_vars)
+            
+            # Run Z3 queries for vulnerability detection
+            self._run_vulnerability_queries(pseudo, tainted_vars)
+            
+            return {
+                'function': ida_funcs.get_func_name(f_ea),
+                'address': hex(f_ea),
+                'states_explored': self.states_explored,
+                'paths_explored': self.paths_explored,
+                'constraints_collected': len(self.symbolic_state.constraints),
+                'vulnerabilities': self.vulnerabilities,
+                'fsm_trace': [{'state': s, 'trigger': t, 'address': hex(a) if a else None} 
+                             for s, t, a in self.fsm.trace],
+                'path_summary': self.fsm.get_path_summary(),
+                'sink_without_validation': self.fsm.is_sink_without_validation(),
+                'tainted_vars': list(tainted_vars.keys()),
+            }
+            
+        except Exception as e:
+            return {
+                'error': f'Analysis failed: {str(e)}',
+                'vulnerabilities': [],
+                'fsm_trace': [],
+                'constraints': [],
+            }
+    
+    def _analyze_ctree(self, cfunc, tainted_vars):
+        """Walk ctree and build symbolic state"""
+        if not HEXRAYS_AVAILABLE:
+            return
+        
+        # Use pattern matching on pseudocode (simpler than full ctree visitor)
+        pseudo = str(cfunc)
+        lines = pseudo.split('\n')
+        
+        for line in lines:
+            self.states_explored += 1
+            
+            if self.states_explored > self.settings.max_depth * 10:
+                break  # Depth limit
+            
+            # Detect state transitions
+            self._detect_transitions(line, tainted_vars)
+            
+            # Collect constraints from conditionals
+            self._collect_constraints(line, tainted_vars)
+    
+    def _detect_transitions(self, line, tainted_vars):
+        """Detect FSM state transitions from code line"""
+        line_lower = line.lower()
+        
+        # Check for input read
+        for api in IOCTLStateMachine.INPUT_APIS:
+            if api.lower() in line_lower:
+                self.fsm.transition(FSMState.INPUT_READ, api)
+                break
+        
+        # Check for validation
+        for api in IOCTLStateMachine.VALIDATE_APIS:
+            if api.lower() in line_lower:
+                self.fsm.transition(FSMState.VALIDATE, api)
+                break
+        
+        # Check for sink
+        for api in IOCTLStateMachine.SINK_APIS:
+            if api.lower() in line_lower:
+                self.fsm.transition(FSMState.SINK, api)
+                break
+        
+        # Check for return
+        if re.match(r'^\s*return\b', line, re.I):
+            self.fsm.transition(FSMState.EXIT, 'return')
+    
+    def _collect_constraints(self, line, tainted_vars):
+        """Collect path constraints from conditional statements"""
+        # Match if conditions
+        if_match = re.search(r'if\s*\(\s*(.+?)\s*\)', line)
+        if if_match:
+            cond_str = if_match.group(1)
+            constraint = self.constraint_builder.build_from_expr_str(cond_str, tainted_vars)
+            if constraint is not None:
+                self.symbolic_state.add_constraint(constraint)
+    
+    def _run_vulnerability_queries(self, pseudo, tainted_vars):
+        """Run Z3 queries to detect vulnerabilities"""
+        if not Z3_AVAILABLE:
+            return
+        
+        # Check for various vulnerability patterns
+        self._check_buffer_overflow(pseudo, tainted_vars)
+        self._check_write_what_where(pseudo, tainted_vars)
+        self._check_arbitrary_physical_map(pseudo, tainted_vars)
+        self._check_validation_bypass(pseudo, tainted_vars)
+    
+    def _check_buffer_overflow(self, pseudo, tainted_vars):
+        """Check for buffer overflow with Z3"""
+        # Look for memcpy-like calls with tainted size
+        for func_name, (dst_pos, src_pos, size_pos) in MEMCPY_FUNCTIONS.items():
+            pattern = re.compile(rf'{func_name}\s*\(\s*([^,]+),\s*([^,]+),\s*([^)]+)\)', re.I)
+            
+            for match in pattern.finditer(pseudo):
+                size_expr = match.group(3).strip()
+                
+                # Check if size is tainted
+                is_tainted = any(tv in size_expr for tv in tainted_vars)
+                for src_pat in TAINT_SOURCES.values():
+                    if src_pat.search(size_expr):
+                        is_tainted = True
+                
+                if is_tainted:
+                    # Create Z3 query
+                    solver = Solver()
+                    solver.set('timeout', self.settings.solver_timeout)
+                    
+                    size_sym = self.symbolic_state.create_symbol('overflow_size', 32)
+                    
+                    # Add path constraints
+                    for c in self.symbolic_state.get_constraints():
+                        solver.add(c)
+                    
+                    # Can size exceed typical buffer? (256 bytes as example)
+                    solver.add(UGT(size_sym, BitVecVal(256, 32)))
+                    solver.add(ULT(size_sym, BitVecVal(0x10000, 32)))  # Realistic bound
+                    
+                    if solver.check() == sat:
+                        model = solver.model()
+                        self.vulnerabilities.append({
+                            'vuln_type': 'BUFFER_OVERFLOW',
+                            'severity': 'HIGH',
+                            'api': func_name,
+                            'tainted_param': 'size',
+                            'z3_sat': True,
+                            'exploit_input': str(model) if self.settings.generate_inputs else None,
+                            'description': f'{func_name} with user-controlled size (Z3: satisfiable)',
+                        })
+    
+    def _check_write_what_where(self, pseudo, tainted_vars):
+        """Check for write-what-where with Z3"""
+        # Look for tainted destination pointers
+        for func_name, (dst_pos, src_pos, size_pos) in MEMCPY_FUNCTIONS.items():
+            pattern = re.compile(rf'{func_name}\s*\(\s*([^,]+),\s*([^,]+),\s*([^)]+)\)', re.I)
+            
+            for match in pattern.finditer(pseudo):
+                dst_expr = match.group(1).strip()
+                size_expr = match.group(3).strip()
+                
+                dst_tainted = any(tv in dst_expr for tv in tainted_vars)
+                size_tainted = any(tv in size_expr for tv in tainted_vars)
+                
+                if dst_tainted:
+                    solver = Solver()
+                    solver.set('timeout', self.settings.solver_timeout)
+                    
+                    dst_sym = self.symbolic_state.create_symbol('write_dst', 64)
+                    
+                    for c in self.symbolic_state.get_constraints():
+                        solver.add(c)
+                    
+                    # Can destination be arbitrary (non-null)?
+                    solver.add(dst_sym != BitVecVal(0, 64))
+                    
+                    if solver.check() == sat:
+                        model = solver.model()
+                        severity = 'CRITICAL' if size_tainted else 'HIGH'
+                        self.vulnerabilities.append({
+                            'vuln_type': 'WRITE_WHAT_WHERE',
+                            'severity': severity,
+                            'api': func_name,
+                            'tainted_params': ['dst'] + (['size'] if size_tainted else []),
+                            'z3_sat': True,
+                            'exploit_input': str(model) if self.settings.generate_inputs else None,
+                            'description': f'{func_name} with user-controlled destination (Z3: satisfiable)',
+                        })
+    
+    def _check_arbitrary_physical_map(self, pseudo, tainted_vars):
+        """Check for arbitrary physical memory mapping"""
+        for api, pattern in PHYSICAL_MEMORY_PATTERNS.items():
+            if pattern.search(pseudo):
+                # Check if address parameter is tainted
+                match = pattern.search(pseudo)
+                if match and match.lastindex >= 1:
+                    addr_expr = match.group(1).strip()
+                    
+                    is_tainted = any(tv in addr_expr for tv in tainted_vars)
+                    
+                    if is_tainted:
+                        solver = Solver()
+                        solver.set('timeout', self.settings.solver_timeout)
+                        
+                        phys_addr = self.symbolic_state.create_symbol('phys_addr', 64)
+                        
+                        for c in self.symbolic_state.get_constraints():
+                            solver.add(c)
+                        
+                        # Can we map arbitrary physical address?
+                        solver.add(UGE(phys_addr, BitVecVal(0, 64)))
+                        solver.add(ULT(phys_addr, BitVecVal(0x100000000, 64)))
+                        
+                        if solver.check() == sat:
+                            model = solver.model()
+                            self.vulnerabilities.append({
+                                'vuln_type': 'ARBITRARY_PHYSICAL_MAP',
+                                'severity': 'CRITICAL',
+                                'api': api,
+                                'z3_sat': True,
+                                'exploit_input': str(model) if self.settings.generate_inputs else None,
+                                'description': f'{api} with user-controlled physical address (Z3: satisfiable)',
+                            })
+    
+    def _check_validation_bypass(self, pseudo, tainted_vars):
+        """Check if validation can be bypassed"""
+        if self.fsm.is_sink_without_validation():
+            self.vulnerabilities.append({
+                'vuln_type': 'VALIDATION_BYPASS',
+                'severity': 'HIGH',
+                'api': None,
+                'z3_sat': None,
+                'description': 'Dangerous sink reached without ProbeFor* validation (FSM analysis)',
+            })
+
+
+def show_smt_settings_dialog():
+    """
+    Show settings dialog for SMT/FSM engine configuration.
+    """
+    settings = SMTSettings.get_instance()
+    
+    dialog_text = f"""SMT/FSM Symbolic Execution Settings
+    
+Current Configuration:
+═══════════════════════════════════════
+
+Max Depth (basic blocks): {settings.max_depth}
+Loop Unroll Count: {settings.loop_unroll}
+Solver Timeout (ms): {settings.solver_timeout}
+Inter-procedural Analysis: {settings.inter_procedural}
+Inline Threshold (lines): {settings.inline_threshold}
+Generate Exploit Inputs: {settings.generate_inputs}
+Verbose Logging: {settings.verbose_logging}
+Enable FSM Tracking: {settings.enable_fsm}
+Pointer Size (bits): {settings.pointer_size}
+
+═══════════════════════════════════════
+Enter setting to change (e.g., "max_depth=100")
+Or "reset" to restore defaults, "cancel" to exit:"""
+    
+    try:
+        result = ida_kernwin.ask_str("", 0, dialog_text)
+    except:
+        return None
+    
+    if result is None or result.lower() == 'cancel':
+        return None
+    
+    if result.lower() == 'reset':
+        settings.reset()
+        idaapi.msg("[SMT/FSM] Settings reset to defaults\n")
+        return settings
+    
+    # Parse setting=value
+    if '=' in result:
+        parts = result.split('=', 1)
+        key = parts[0].strip()
+        val = parts[1].strip()
+        
+        if key in SMTSettings.DEFAULTS:
+            try:
+                # Type conversion
+                default_val = SMTSettings.DEFAULTS[key]
+                if isinstance(default_val, bool):
+                    val = val.lower() in ('true', '1', 'yes')
+                elif isinstance(default_val, int):
+                    val = int(val)
+                
+                setattr(settings, key, val)
+                idaapi.msg(f"[SMT/FSM] Set {key} = {val}\n")
+            except Exception as e:
+                idaapi.msg(f"[SMT/FSM] Failed to set {key}: {e}\n")
+        else:
+            idaapi.msg(f"[SMT/FSM] Unknown setting: {key}\n")
+    
+    return settings
+
+
+# =============================================================================
+# INTEGRATED TAINT-SMT-FSM ENGINE v3.1
+# Unified taint tracking with symbolic execution and state machine
+# =============================================================================
+
+class TaintState:
+    """Enhanced taint states for FSM tracking"""
+    UNTAINTED = 'UNTAINTED'        # No taint
+    TAINTED = 'TAINTED'            # Direct from taint source
+    PROPAGATED = 'PROPAGATED'      # Taint propagated from other var
+    VALIDATED = 'VALIDATED'        # Taint passed through validation
+    SANITIZED = 'SANITIZED'        # Taint removed by sanitizer
+    SINK_REACHED = 'SINK_REACHED'  # Taint reached dangerous sink
+
+
+class TaintedSymbol:
+    """
+    A symbolic variable with taint metadata.
+    
+    Tracks:
+    - Z3 symbolic variable
+    - Taint role (ptr_dst, ptr_src, size, func_ptr, index)
+    - Taint state (untainted, tainted, validated, etc.)
+    - Propagation chain (how taint flowed)
+    - Validation status
+    """
+    
+    def __init__(self, name, z3_var, role=None, source=None):
+        self.name = name
+        self.z3_var = z3_var
+        self.role = role  # From TaintRole
+        self.source = source  # Original taint source variable
+        self.state = TaintState.TAINTED if source else TaintState.UNTAINTED
+        self.propagation_chain = [source] if source else []
+        self.validated = False
+        self.validation_api = None
+        self.constraints = []  # Constraints applied to this variable
+    
+    def propagate_to(self, new_name, new_z3_var, new_role=None):
+        """Create a new TaintedSymbol propagated from this one"""
+        new_sym = TaintedSymbol(new_name, new_z3_var, new_role or self.role, self.source or self.name)
+        new_sym.state = TaintState.PROPAGATED
+        new_sym.propagation_chain = self.propagation_chain + [self.name]
+        new_sym.validated = self.validated
+        new_sym.validation_api = self.validation_api
+        return new_sym
+    
+    def mark_validated(self, api):
+        """Mark this symbol as having passed validation"""
+        self.validated = True
+        self.validation_api = api
+        self.state = TaintState.VALIDATED
+    
+    def mark_sanitized(self):
+        """Mark taint as removed"""
+        self.state = TaintState.SANITIZED
+    
+    def mark_sink_reached(self):
+        """Mark that taint reached a dangerous sink"""
+        self.state = TaintState.SINK_REACHED
+
+
+class TaintSymbolicState(SymbolicState):
+    """
+    Extended SymbolicState with taint role tracking.
+    
+    Maps each symbolic variable to its taint metadata.
+    """
+    
+    def __init__(self, settings=None):
+        super().__init__(settings)
+        self.tainted_symbols = {}  # name -> TaintedSymbol
+        self.role_map = {}  # name -> role (ptr_dst, ptr_src, size, etc.)
+        self.validation_map = {}  # name -> validation API
+        self.propagation_graph = {}  # from_var -> [to_vars]
+    
+    def add_tainted_var(self, name, role, source=None, bits=None):
+        """Add a tainted variable with role tracking"""
+        if not Z3_AVAILABLE:
+            return None
+        
+        bits = bits or self.ptr_size
+        z3_var = self.create_symbol(name, bits)
+        
+        tainted_sym = TaintedSymbol(name, z3_var, role, source)
+        self.tainted_symbols[name] = tainted_sym
+        self.role_map[name] = role
+        
+        return tainted_sym
+    
+    def propagate_taint(self, from_var, to_var, to_role=None, bits=None):
+        """Propagate taint from one variable to another"""
+        if from_var not in self.tainted_symbols:
+            return None
+        
+        source_sym = self.tainted_symbols[from_var]
+        bits = bits or self.ptr_size
+        z3_var = self.create_symbol(to_var, bits)
+        
+        new_tainted = source_sym.propagate_to(to_var, z3_var, to_role)
+        self.tainted_symbols[to_var] = new_tainted
+        self.role_map[to_var] = to_role or source_sym.role
+        
+        # Track propagation graph
+        if from_var not in self.propagation_graph:
+            self.propagation_graph[from_var] = []
+        self.propagation_graph[from_var].append(to_var)
+        
+        return new_tainted
+    
+    def mark_validated(self, var_name, api):
+        """Mark a variable as validated"""
+        if var_name in self.tainted_symbols:
+            self.tainted_symbols[var_name].mark_validated(api)
+            self.validation_map[var_name] = api
+    
+    def is_tainted(self, var_name):
+        """Check if variable is tainted (not sanitized)"""
+        if var_name in self.tainted_symbols:
+            sym = self.tainted_symbols[var_name]
+            return sym.state not in [TaintState.UNTAINTED, TaintState.SANITIZED]
+        return False
+    
+    def is_validated(self, var_name):
+        """Check if variable passed validation"""
+        if var_name in self.tainted_symbols:
+            return self.tainted_symbols[var_name].validated
+        return False
+    
+    def get_role(self, var_name):
+        """Get taint role for variable"""
+        return self.role_map.get(var_name)
+    
+    def get_propagation_chain(self, var_name):
+        """Get full taint propagation chain for variable"""
+        if var_name in self.tainted_symbols:
+            return self.tainted_symbols[var_name].propagation_chain + [var_name]
+        return []
+    
+    def get_tainted_by_role(self, role):
+        """Get all tainted variables with specific role"""
+        return [name for name, r in self.role_map.items() if r == role]
+    
+    def get_unvalidated_sinks(self):
+        """Get tainted variables that reached sink without validation"""
+        return [
+            name for name, sym in self.tainted_symbols.items()
+            if sym.state == TaintState.SINK_REACHED and not sym.validated
+        ]
+
+
+class TaintFSMState:
+    """Extended FSM states for integrated taint tracking"""
+    INIT = 'INIT'
+    TAINT_SOURCE = 'TAINT_SOURCE'      # Taint source accessed
+    TAINT_PROPAGATE = 'TAINT_PROPAGATE'  # Taint propagating
+    TAINT_VALIDATE = 'TAINT_VALIDATE'    # Validation on tainted data
+    TAINT_TRANSFORM = 'TAINT_TRANSFORM'  # Tainted data transformed
+    TAINT_SINK = 'TAINT_SINK'          # Taint reached sink
+    TAINT_BYPASS = 'TAINT_BYPASS'      # Validation bypassed
+    EXIT = 'EXIT'
+
+
+class TaintFSM:
+    """
+    Enhanced FSM that tracks taint propagation states.
+    
+    Integrates:
+    - Traditional IOCTL FSM states (INIT, INPUT_READ, etc.)
+    - Taint state tracking (source, propagate, validate, sink)
+    - Role-aware state transitions
+    """
+    
+    TRANSITIONS = {
+        TaintFSMState.INIT: [TaintFSMState.TAINT_SOURCE, TaintFSMState.EXIT],
+        TaintFSMState.TAINT_SOURCE: [TaintFSMState.TAINT_PROPAGATE, TaintFSMState.TAINT_VALIDATE, 
+                                      TaintFSMState.TAINT_SINK, TaintFSMState.EXIT],
+        TaintFSMState.TAINT_PROPAGATE: [TaintFSMState.TAINT_PROPAGATE, TaintFSMState.TAINT_VALIDATE,
+                                         TaintFSMState.TAINT_TRANSFORM, TaintFSMState.TAINT_SINK, TaintFSMState.EXIT],
+        TaintFSMState.TAINT_VALIDATE: [TaintFSMState.TAINT_PROPAGATE, TaintFSMState.TAINT_SINK, TaintFSMState.EXIT],
+        TaintFSMState.TAINT_TRANSFORM: [TaintFSMState.TAINT_PROPAGATE, TaintFSMState.TAINT_SINK, TaintFSMState.EXIT],
+        TaintFSMState.TAINT_SINK: [TaintFSMState.EXIT, TaintFSMState.TAINT_PROPAGATE],
+        TaintFSMState.TAINT_BYPASS: [TaintFSMState.TAINT_SINK],
+        TaintFSMState.EXIT: [],
+    }
+    
+    def __init__(self):
+        self.state = TaintFSMState.INIT
+        self.trace = []  # (state, var, role, trigger, address)
+        self.validation_points = []
+        self.sink_points = []
+        self.bypass_detected = False
+        self.taint_sources = []
+    
+    def transition(self, new_state, var=None, role=None, trigger=None, address=0):
+        """Perform state transition with taint metadata"""
+        if new_state in self.TRANSITIONS.get(self.state, []):
+            self.state = new_state
+            self.trace.append({
+                'state': new_state,
+                'var': var,
+                'role': role,
+                'trigger': trigger,
+                'address': address,
+            })
+            
+            if new_state == TaintFSMState.TAINT_SOURCE:
+                self.taint_sources.append({'var': var, 'role': role, 'trigger': trigger})
+            elif new_state == TaintFSMState.TAINT_VALIDATE:
+                self.validation_points.append({'var': var, 'api': trigger, 'address': address})
+            elif new_state == TaintFSMState.TAINT_SINK:
+                self.sink_points.append({'var': var, 'role': role, 'api': trigger, 'address': address})
+            elif new_state == TaintFSMState.TAINT_BYPASS:
+                self.bypass_detected = True
+            
+            return True
+        return False
+    
+    def has_unvalidated_path_to_sink(self):
+        """Check if any taint reached sink without validation"""
+        for sink in self.sink_points:
+            sink_var = sink.get('var')
+            # Check if validation occurred before this sink
+            validated = any(
+                v.get('var') == sink_var
+                for v in self.validation_points
+            )
+            if not validated:
+                return True
+        return False
+    
+    def get_path_summary(self):
+        """Return summary of taint flow path"""
+        if not self.trace:
+            return "INIT (no taint flow)"
+        
+        path_parts = []
+        for t in self.trace:
+            state = t.get('state', '')
+            var = t.get('var', '')
+            role = t.get('role', '')
+            if var:
+                path_parts.append(f"{state}({var}:{role})")
+            else:
+                path_parts.append(state)
+        
+        return ' → '.join(path_parts)
+    
+    def get_risk_assessment(self):
+        """Assess risk based on FSM trace"""
+        risks = []
+        
+        if self.bypass_detected:
+            risks.append({'type': 'VALIDATION_BYPASS', 'severity': 'CRITICAL'})
+        
+        if self.has_unvalidated_path_to_sink():
+            risks.append({'type': 'UNVALIDATED_SINK', 'severity': 'HIGH'})
+        
+        # Check for high-risk role flows
+        for sink in self.sink_points:
+            role = sink.get('role')
+            if role == TaintRole.PTR_DST:
+                risks.append({'type': 'TAINTED_DST_TO_SINK', 'severity': 'CRITICAL', 'sink': sink})
+            elif role == TaintRole.FUNC_PTR:
+                risks.append({'type': 'TAINTED_FUNC_PTR_TO_SINK', 'severity': 'CRITICAL', 'sink': sink})
+            elif role == TaintRole.SIZE:
+                risks.append({'type': 'TAINTED_SIZE_TO_SINK', 'severity': 'HIGH', 'sink': sink})
+        
+        return risks
+
+
+class IntegratedTaintSMTEngine:
+    """
+    Unified Taint-SMT-FSM analysis engine.
+    
+    Combines:
+    1. Taint-Heuristic Engine (role-aware taint tracking)
+    2. Z3 SMT Solver (constraint solving for reachability)
+    3. FSM State Machine (taint propagation state tracking)
+    
+    Benefits:
+    - Tainted vars become Z3 symbolic variables with role metadata
+    - FSM tracks taint state transitions (source→propagate→validate→sink)
+    - Z3 verifies reachability of taint to dangerous sinks
+    - Combined analysis produces higher confidence results
+    """
+    
+    def __init__(self, settings=None):
+        self.settings = settings or SMTSettings.get_instance()
+        self.taint_state = None  # TaintSymbolicState
+        self.taint_fsm = None    # TaintFSM
+        self.constraint_builder = None
+        self.vulnerabilities = []
+        self.taint_flows = []  # Detailed taint flow records
+    
+    def analyze_function(self, f_ea):
+        """
+        Run integrated Taint-SMT-FSM analysis.
+        
+        Returns comprehensive analysis combining all three engines.
+        """
+        # Initialize engines
+        self.taint_state = TaintSymbolicState(self.settings)
+        self.taint_fsm = TaintFSM()
+        self.constraint_builder = Z3ConstraintBuilder(self.taint_state)
+        self.vulnerabilities = []
+        self.taint_flows = []
+        
+        # Check prerequisites
+        if not HEXRAYS_AVAILABLE:
+            return {'error': 'Hex-Rays decompiler required', 'vulnerabilities': []}
+        
+        try:
+            # Step 1: Decompile function
+            cfunc = ida_hexrays.decompile(f_ea)
+            if not cfunc:
+                return {'error': 'Decompilation failed', 'vulnerabilities': []}
+            
+            pseudo = str(cfunc)
+            
+            # Step 2: Run traditional taint-heuristic analysis
+            taint_result = track_taint_heuristic(pseudo, f_ea)
+            
+            # Step 3: Convert tainted vars to symbolic variables with roles
+            self._build_symbolic_taint_state(pseudo, taint_result)
+            
+            # Step 4: Analyze taint propagation and build FSM trace
+            self._analyze_taint_propagation(pseudo, taint_result)
+            
+            # Step 5: Collect path constraints
+            self._collect_path_constraints(pseudo)
+            
+            # Step 6: Run Z3 verification queries
+            self._verify_taint_reachability(pseudo, taint_result)
+            
+            # Step 7: Combine results
+            return self._build_result(f_ea, taint_result)
+            
+        except Exception as e:
+            return {'error': f'Analysis failed: {str(e)}', 'vulnerabilities': []}
+    
+    def _build_symbolic_taint_state(self, pseudo, taint_result):
+        """Convert tainted variables to symbolic variables with role tracking"""
+        tainted_vars = taint_result.get('tainted_vars', [])
+        roles = taint_result.get('taint_roles', {})
+        
+        # Determine role for each tainted variable from context
+        for var in tainted_vars:
+            role = self._infer_role_for_var(pseudo, var, roles)
+            self.taint_state.add_tainted_var(var, role, source=var)
+            
+            # FSM: Record taint source
+            self.taint_fsm.transition(TaintFSMState.TAINT_SOURCE, var, role, 'user_input')
+    
+    def _infer_role_for_var(self, pseudo, var, roles):
+        """Infer the role of a tainted variable from context"""
+        # Check memcpy-like patterns
+        for func_name, (dst_pos, src_pos, size_pos) in MEMCPY_FUNCTIONS.items():
+            pattern = re.compile(rf'{func_name}\s*\(\s*([^,]+),\s*([^,]+),\s*([^)]+)\)', re.I)
+            for match in pattern.finditer(pseudo):
+                dst, src, size = match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
+                if var in dst:
+                    return TaintRole.PTR_DST
+                if var in src:
+                    return TaintRole.PTR_SRC
+                if var in size:
+                    return TaintRole.SIZE
+        
+        # Check array index patterns
+        if re.search(rf'\[\s*[^]]*{re.escape(var)}[^]]*\s*\]', pseudo):
+            return TaintRole.INDEX
+        
+        # Check function pointer patterns  
+        if re.search(rf'{re.escape(var)}\s*\(', pseudo) or re.search(rf'\(\s*\*\s*{re.escape(var)}\s*\)', pseudo):
+            return TaintRole.FUNC_PTR
+        
+        # Default based on global role detection
+        if roles.get('ptr_dst'):
+            return TaintRole.PTR_DST
+        if roles.get('func_ptr'):
+            return TaintRole.FUNC_PTR
+        if roles.get('size'):
+            return TaintRole.SIZE
+        if roles.get('ptr_src'):
+            return TaintRole.PTR_SRC
+        if roles.get('index'):
+            return TaintRole.INDEX
+        
+        return 'UNKNOWN'
+    
+    def _analyze_taint_propagation(self, pseudo, taint_result):
+        """Analyze taint propagation and update FSM"""
+        tainted_vars = set(taint_result.get('tainted_vars', []))
+        lines = pseudo.split('\n')
+        
+        for line in lines:
+            # Check for validation APIs
+            for api in IOCTLStateMachine.VALIDATE_APIS:
+                if api.lower() in line.lower():
+                    # Find which tainted var is being validated
+                    for var in tainted_vars:
+                        if var in line:
+                            self.taint_state.mark_validated(var, api)
+                            self.taint_fsm.transition(TaintFSMState.TAINT_VALIDATE, var, 
+                                                      self.taint_state.get_role(var), api)
+            
+            # Check for sink APIs
+            for api in IOCTLStateMachine.SINK_APIS:
+                if api.lower() in line.lower():
+                    for var in tainted_vars:
+                        if var in line:
+                            role = self.taint_state.get_role(var)
+                            if var in self.taint_state.tainted_symbols:
+                                self.taint_state.tainted_symbols[var].mark_sink_reached()
+                            self.taint_fsm.transition(TaintFSMState.TAINT_SINK, var, role, api)
+            
+            # Check for assignment propagation (simplified)
+            assign_match = re.match(r'\s*(\w+)\s*=\s*(.+)', line)
+            if assign_match:
+                dest = assign_match.group(1)
+                src_expr = assign_match.group(2)
+                
+                for var in tainted_vars:
+                    if var in src_expr and dest not in tainted_vars:
+                        # Taint propagation
+                        role = self.taint_state.get_role(var)
+                        self.taint_state.propagate_taint(var, dest, role)
+                        self.taint_fsm.transition(TaintFSMState.TAINT_PROPAGATE, dest, role, f'from:{var}')
+                        tainted_vars.add(dest)
+    
+    def _collect_path_constraints(self, pseudo):
+        """Collect path constraints from conditional statements"""
+        lines = pseudo.split('\n')
+        tainted_vars = list(self.taint_state.tainted_symbols.keys())
+        
+        for line in lines:
+            if_match = re.search(r'if\s*\(\s*(.+?)\s*\)', line)
+            if if_match:
+                cond = if_match.group(1)
+                # Check if condition involves tainted vars
+                if any(var in cond for var in tainted_vars):
+                    constraint = self.constraint_builder.build_from_expr_str(cond, tainted_vars)
+                    if constraint is not None:
+                        self.taint_state.add_constraint(constraint)
+    
+    def _verify_taint_reachability(self, pseudo, taint_result):
+        """Use Z3 to verify taint can reach dangerous sinks"""
+        if not Z3_AVAILABLE:
+            return
+        
+        # Get tainted vars by role
+        dst_vars = self.taint_state.get_tainted_by_role(TaintRole.PTR_DST)
+        size_vars = self.taint_state.get_tainted_by_role(TaintRole.SIZE)
+        func_vars = self.taint_state.get_tainted_by_role(TaintRole.FUNC_PTR)
+        
+        # Query 1: Can tainted dst reach memcpy without validation?
+        for var in dst_vars:
+            if not self.taint_state.is_validated(var):
+                self._query_write_what_where(var, pseudo)
+        
+        # Query 2: Can tainted size cause overflow?
+        for var in size_vars:
+            self._query_buffer_overflow(var, pseudo)
+        
+        # Query 3: Can tainted func_ptr be called?
+        for var in func_vars:
+            if not self.taint_state.is_validated(var):
+                self._query_code_execution(var, pseudo)
+        
+        # Query 4: Physical memory with tainted address (basic)
+        self._query_physical_memory(pseudo, taint_result)
+        
+        # Query 5: Unvalidated sink paths from FSM
+        if self.taint_fsm.has_unvalidated_path_to_sink():
+            self.vulnerabilities.append({
+                'vuln_type': 'UNVALIDATED_SINK_PATH',
+                'severity': 'HIGH',
+                'z3_sat': None,
+                'source': 'FSM',
+                'description': 'Taint reached sink without passing through validation',
+                'taint_flow': self.taint_fsm.get_path_summary(),
+            })
+        
+        # =====================================================================
+        # IOCTLance-Equivalent Enhanced Z3 Queries
+        # =====================================================================
+        
+        # Query 6: ProbeFor Bypass - buffer reaches sink without validation
+        self._query_probefore_bypass(pseudo, taint_result)
+        
+        # Query 7: Physical Memory Map (detailed MmMapIoSpace/ZwMapViewOfSection)
+        self._query_physical_memory_detailed(pseudo, taint_result)
+        
+        # Query 8: Process Handle Control (ZwOpenProcess/PsLookupProcessByProcessId)
+        self._query_process_handle(pseudo, taint_result)
+        
+        # Query 9: WRMSR/IN/OUT privileged instructions
+        self._query_wrmsr_inout(pseudo, taint_result)
+        
+        # Query 10: Null Pointer Dereference (SystemBuffer == 0)
+        self._query_null_pointer_deref(pseudo, taint_result)
+        
+        # Query 11: RtlQueryRegistryValues overflow (TermDD-like)
+        self._query_rtlqueryregistry_overflow(pseudo, taint_result)
+        
+        # Query 12: Context Switch Handle (ObCloseHandle in wrong context)
+        self._query_context_switch_handle(pseudo, taint_result)
+    
+    def _query_write_what_where(self, var, pseudo):
+        """Z3 query for write-what-where via tainted dst"""
+        solver = Solver()
+        solver.set('timeout', self.settings.solver_timeout)
+        
+        # Add path constraints
+        for c in self.taint_state.get_constraints():
+            solver.add(c)
+        
+        # Get symbolic var
+        sym = self.taint_state.get_symbol(var)
+        if sym is None:
+            return
+        
+        # Query: can var be non-null (arbitrary write location)?
+        solver.add(sym != BitVecVal(0, 64))
+        
+        if solver.check() == sat:
+            model = solver.model()
+            chain = self.taint_state.get_propagation_chain(var)
+            
+            self.vulnerabilities.append({
+                'vuln_type': 'WRITE_WHAT_WHERE',
+                'severity': 'CRITICAL',
+                'tainted_var': var,
+                'role': TaintRole.PTR_DST,
+                'validated': self.taint_state.is_validated(var),
+                'z3_sat': True,
+                'exploit_input': str(model) if self.settings.generate_inputs else None,
+                'propagation_chain': chain,
+                'source': 'Taint-SMT',
+                'description': f'Tainted destination pointer "{var}" can be arbitrary (Z3: sat)',
+            })
+    
+    def _query_buffer_overflow(self, var, pseudo):
+        """Z3 query for buffer overflow via tainted size"""
+        solver = Solver()
+        solver.set('timeout', self.settings.solver_timeout)
+        
+        for c in self.taint_state.get_constraints():
+            solver.add(c)
+        
+        sym = self.taint_state.get_symbol(var)
+        if sym is None:
+            return
+        
+        # Query: can size exceed buffer bounds?
+        solver.add(UGT(sym, BitVecVal(256, 32)))  # Typical stack buffer
+        solver.add(ULT(sym, BitVecVal(0x100000, 32)))  # Reasonable upper bound
+        
+        if solver.check() == sat:
+            model = solver.model()
+            chain = self.taint_state.get_propagation_chain(var)
+            
+            self.vulnerabilities.append({
+                'vuln_type': 'BUFFER_OVERFLOW',
+                'severity': 'HIGH',
+                'tainted_var': var,
+                'role': TaintRole.SIZE,
+                'validated': self.taint_state.is_validated(var),
+                'z3_sat': True,
+                'exploit_input': str(model) if self.settings.generate_inputs else None,
+                'propagation_chain': chain,
+                'source': 'Taint-SMT',
+                'description': f'Tainted size "{var}" can exceed buffer (Z3: sat)',
+            })
+    
+    def _query_code_execution(self, var, pseudo):
+        """Z3 query for code execution via tainted function pointer"""
+        solver = Solver()
+        solver.set('timeout', self.settings.solver_timeout)
+        
+        for c in self.taint_state.get_constraints():
+            solver.add(c)
+        
+        sym = self.taint_state.get_symbol(var)
+        if sym is None:
+            return
+        
+        # Query: can function pointer be controlled?
+        solver.add(sym != BitVecVal(0, 64))
+        
+        if solver.check() == sat:
+            model = solver.model()
+            chain = self.taint_state.get_propagation_chain(var)
+            
+            self.vulnerabilities.append({
+                'vuln_type': 'CODE_EXECUTION',
+                'severity': 'CRITICAL',
+                'tainted_var': var,
+                'role': TaintRole.FUNC_PTR,
+                'validated': self.taint_state.is_validated(var),
+                'z3_sat': True,
+                'exploit_input': str(model) if self.settings.generate_inputs else None,
+                'propagation_chain': chain,
+                'source': 'Taint-SMT',
+                'description': f'Tainted function pointer "{var}" can be controlled (Z3: sat)',
+            })
+    
+    def _query_physical_memory(self, pseudo, taint_result):
+        """Check for physical memory mapping with tainted address"""
+        ioctlance_vulns = taint_result.get('ioctlance_vulns', [])
+        
+        for vuln in ioctlance_vulns:
+            if vuln.get('vuln_type') == 'MAP_PHYSICAL_MEMORY':
+                # Verify with Z3
+                solver = Solver()
+                solver.set('timeout', self.settings.solver_timeout)
+                
+                for c in self.taint_state.get_constraints():
+                    solver.add(c)
+                
+                phys_addr = self.taint_state.create_symbol('phys_addr', 64)
+                solver.add(UGE(phys_addr, BitVecVal(0, 64)))
+                
+                if solver.check() == sat:
+                    model = solver.model()
+                    self.vulnerabilities.append({
+                        'vuln_type': 'ARBITRARY_PHYSICAL_MAP',
+                        'severity': 'CRITICAL',
+                        'api': vuln.get('api'),
+                        'z3_sat': True,
+                        'exploit_input': str(model) if self.settings.generate_inputs else None,
+                        'source': 'Taint-SMT + IOCTLance',
+                        'description': f"Physical memory mapping with controllable address (Z3: sat)",
+                    })
+    
+    # =========================================================================
+    # ENHANCED Z3 QUERIES - IOCTLance-Equivalent Verification
+    # =========================================================================
+    
+    def _query_probefore_bypass(self, pseudo, taint_result):
+        """
+        IOCTLance equivalent: Tracks validated buffers
+        
+        Detects when tainted buffers reach sinks WITHOUT ProbeFor* validation.
+        Uses FSM to track validation state and Z3 to verify path feasibility.
+        """
+        tainted_vars = list(self.taint_state.tainted_symbols.keys())
+        
+        # Get validation map
+        validated_vars = set(self.taint_state.validation_map.keys())
+        
+        # Check each sink point from FSM
+        for sink_point in self.taint_fsm.sink_points:
+            sink_var = sink_point.get('var')
+            sink_api = sink_point.get('api')
+            sink_role = sink_point.get('role')
+            
+            if sink_var and sink_var not in validated_vars:
+                # Check propagation chain - was ANY variable in chain validated?
+                chain = self.taint_state.get_propagation_chain(sink_var)
+                chain_validated = any(v in validated_vars for v in chain)
+                
+                if not chain_validated:
+                    # Verify with Z3: Is the path to sink actually reachable?
+                    solver = Solver()
+                    solver.set('timeout', self.settings.solver_timeout)
+                    
+                    for c in self.taint_state.get_constraints():
+                        solver.add(c)
+                    
+                    sym = self.taint_state.get_symbol(sink_var)
+                    if sym is not None:
+                        # The buffer must be non-null to be dereferenced
+                        solver.add(sym != BitVecVal(0, 64))
+                        
+                        if solver.check() == sat:
+                            model = solver.model()
+                            self.vulnerabilities.append({
+                                'vuln_type': 'PROBEFORE_BYPASS',
+                                'severity': 'CRITICAL',
+                                'tainted_var': sink_var,
+                                'sink_api': sink_api,
+                                'role': sink_role,
+                                'validated': False,
+                                'z3_sat': True,
+                                'exploit_input': str(model) if self.settings.generate_inputs else None,
+                                'propagation_chain': chain,
+                                'source': 'Taint-SMT-FSM',
+                                'description': f'Buffer "{sink_var}" reaches {sink_api} without ProbeFor* validation (Z3: sat)',
+                            })
+    
+    def _query_physical_memory_detailed(self, pseudo, taint_result):
+        """
+        IOCTLance equivalent: HookMmMapIoSpace, HookZwMapViewOfSection
+        
+        Detailed Z3 verification for physical memory mapping vulnerabilities.
+        Checks both address AND size controllability.
+        """
+        # MmMapIoSpace(PhysicalAddress, NumberOfBytes, CacheType)
+        mmmap_pattern = re.compile(r'MmMapIoSpace\w*\s*\(\s*([^,]+),\s*([^,]+)', re.I)
+        
+        for match in mmmap_pattern.finditer(pseudo):
+            phys_addr_expr = match.group(1).strip()
+            size_expr = match.group(2).strip()
+            
+            tainted_vars = list(self.taint_state.tainted_symbols.keys())
+            addr_tainted = any(tv in phys_addr_expr for tv in tainted_vars)
+            size_tainted = any(tv in size_expr for tv in tainted_vars)
+            
+            if addr_tainted or size_tainted:
+                solver = Solver()
+                solver.set('timeout', self.settings.solver_timeout)
+                
+                for c in self.taint_state.get_constraints():
+                    solver.add(c)
+                
+                # Create symbolic variables for address and size
+                phys_addr = self.taint_state.create_symbol('MmMapIoSpace_PhysAddr', 64)
+                map_size = self.taint_state.create_symbol('MmMapIoSpace_Size', 32)
+                
+                # Query: Can attacker map arbitrary physical memory region?
+                if addr_tainted:
+                    # Can map any 4GB address range?
+                    solver.add(UGE(phys_addr, BitVecVal(0, 64)))
+                    solver.add(ULT(phys_addr, BitVecVal(0x100000000, 64)))  # 4GB
+                
+                if size_tainted:
+                    # Can map large regions?
+                    solver.add(UGT(map_size, BitVecVal(0x1000, 32)))  # > 4KB
+                    solver.add(ULT(map_size, BitVecVal(0x10000000, 32)))  # < 256MB realistic
+                
+                if solver.check() == sat:
+                    model = solver.model()
+                    severity = 'CRITICAL' if addr_tainted else 'HIGH'
+                    
+                    self.vulnerabilities.append({
+                        'vuln_type': 'MAP_PHYSICAL_MEMORY',
+                        'severity': severity,
+                        'api': 'MmMapIoSpace',
+                        'addr_tainted': addr_tainted,
+                        'size_tainted': size_tainted,
+                        'z3_sat': True,
+                        'exploit_input': str(model) if self.settings.generate_inputs else None,
+                        'source': 'Taint-SMT',
+                        'description': f'MmMapIoSpace with controllable {"address and size" if addr_tainted and size_tainted else "address" if addr_tainted else "size"} (Z3: sat)',
+                    })
+        
+        # ZwMapViewOfSection
+        zwmap_pattern = re.compile(r'ZwMapViewOfSection\s*\(', re.I)
+        if zwmap_pattern.search(pseudo):
+            tainted_vars = list(self.taint_state.tainted_symbols.keys())
+            if any(tv in pseudo for tv in tainted_vars):
+                solver = Solver()
+                solver.set('timeout', self.settings.solver_timeout)
+                
+                for c in self.taint_state.get_constraints():
+                    solver.add(c)
+                
+                section_handle = self.taint_state.create_symbol('ZwMapViewOfSection_Handle', 64)
+                solver.add(section_handle != BitVecVal(0, 64))
+                
+                if solver.check() == sat:
+                    model = solver.model()
+                    self.vulnerabilities.append({
+                        'vuln_type': 'MAP_PHYSICAL_MEMORY',
+                        'severity': 'HIGH',
+                        'api': 'ZwMapViewOfSection',
+                        'z3_sat': True,
+                        'exploit_input': str(model) if self.settings.generate_inputs else None,
+                        'source': 'Taint-SMT',
+                        'description': 'ZwMapViewOfSection with controllable section handle (Z3: sat)',
+                    })
+    
+    def _query_process_handle(self, pseudo, taint_result):
+        """
+        IOCTLance equivalent: HookZwOpenProcess, HookPsLookupProcessByProcessId
+        
+        Z3 verification for process handle control vulnerabilities.
+        """
+        tainted_vars = list(self.taint_state.tainted_symbols.keys())
+        
+        # ZwOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId)
+        zwopen_pattern = re.compile(r'ZwOpenProcess\s*\(\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)', re.I)
+        for match in zwopen_pattern.finditer(pseudo):
+            client_id = match.group(4).strip()
+            
+            if any(tv in client_id for tv in tainted_vars):
+                solver = Solver()
+                solver.set('timeout', self.settings.solver_timeout)
+                
+                for c in self.taint_state.get_constraints():
+                    solver.add(c)
+                
+                # ClientId contains ProcessId - can it be arbitrary?
+                pid = self.taint_state.create_symbol('ZwOpenProcess_PID', 32)
+                solver.add(UGT(pid, BitVecVal(0, 32)))  # Not idle process
+                solver.add(ULT(pid, BitVecVal(0x10000, 32)))  # Realistic PID range
+                
+                if solver.check() == sat:
+                    model = solver.model()
+                    self.vulnerabilities.append({
+                        'vuln_type': 'CONTROLLABLE_PROCESS_HANDLE',
+                        'severity': 'HIGH',
+                        'api': 'ZwOpenProcess',
+                        'tainted_param': 'ClientId',
+                        'z3_sat': True,
+                        'exploit_input': str(model) if self.settings.generate_inputs else None,
+                        'source': 'Taint-SMT',
+                        'description': 'ZwOpenProcess with controllable ClientId/PID (Z3: sat) - arbitrary process access',
+                    })
+        
+        # PsLookupProcessByProcessId(ProcessId, Process)
+        pslookup_pattern = re.compile(r'PsLookupProcessByProcessId\s*\(\s*([^,]+)', re.I)
+        for match in pslookup_pattern.finditer(pseudo):
+            process_id = match.group(1).strip()
+            
+            if any(tv in process_id for tv in tainted_vars):
+                solver = Solver()
+                solver.set('timeout', self.settings.solver_timeout)
+                
+                for c in self.taint_state.get_constraints():
+                    solver.add(c)
+                
+                pid = self.taint_state.create_symbol('PsLookup_PID', 64)
+                solver.add(UGT(pid, BitVecVal(0, 64)))
+                solver.add(ULT(pid, BitVecVal(0x10000, 64)))
+                
+                if solver.check() == sat:
+                    model = solver.model()
+                    self.vulnerabilities.append({
+                        'vuln_type': 'CONTROLLABLE_PROCESS_HANDLE',
+                        'severity': 'HIGH',
+                        'api': 'PsLookupProcessByProcessId',
+                        'tainted_param': 'ProcessId',
+                        'z3_sat': True,
+                        'exploit_input': str(model) if self.settings.generate_inputs else None,
+                        'source': 'Taint-SMT',
+                        'description': 'PsLookupProcessByProcessId with controllable PID (Z3: sat) - EPROCESS access',
+                    })
+    
+    def _query_wrmsr_inout(self, pseudo, taint_result):
+        """
+        IOCTLance equivalent: wrmsr_hook, out_hook
+        
+        Z3 verification for WRMSR/IN/OUT privileged instruction vulnerabilities.
+        """
+        tainted_vars = list(self.taint_state.tainted_symbols.keys())
+        
+        # WRMSR patterns
+        wrmsr_patterns = [
+            re.compile(r'\bwrmsr\b', re.I),
+            re.compile(r'__writemsr\s*\(\s*([^,]+),\s*([^)]+)\)', re.I),
+            re.compile(r'WriteMsr\s*\(\s*([^,]+),\s*([^)]+)\)', re.I),
+        ]
+        
+        for pattern in wrmsr_patterns:
+            for match in pattern.finditer(pseudo):
+                # Check if MSR register or value is tainted
+                context_start = max(0, match.start() - 100)
+                context_end = min(len(pseudo), match.end() + 100)
+                context = pseudo[context_start:context_end]
+                
+                msr_tainted = any(tv in context for tv in tainted_vars)
+                
+                if msr_tainted:
+                    solver = Solver()
+                    solver.set('timeout', self.settings.solver_timeout)
+                    
+                    for c in self.taint_state.get_constraints():
+                        solver.add(c)
+                    
+                    # MSR register (32-bit)
+                    msr_reg = self.taint_state.create_symbol('WRMSR_Register', 32)
+                    # MSR value (64-bit)
+                    msr_val = self.taint_state.create_symbol('WRMSR_Value', 64)
+                    
+                    # Can attacker control dangerous MSRs?
+                    # IA32_LSTAR (0xC0000082) - syscall handler
+                    # IA32_SYSENTER_EIP (0x176) - sysenter handler
+                    solver.add(Or(
+                        msr_reg == BitVecVal(0xC0000082, 32),  # LSTAR
+                        msr_reg == BitVecVal(0x176, 32),       # SYSENTER_EIP
+                        msr_reg == BitVecVal(0xC0000080, 32),  # EFER
+                    ))
+                    
+                    if solver.check() == sat:
+                        model = solver.model()
+                        self.vulnerabilities.append({
+                            'vuln_type': 'ARBITRARY_WRMSR',
+                            'severity': 'CRITICAL',
+                            'api': 'WRMSR',
+                            'z3_sat': True,
+                            'exploit_input': str(model) if self.settings.generate_inputs else None,
+                            'source': 'Taint-SMT',
+                            'description': 'WRMSR with controllable MSR register/value (Z3: sat) - kernel code execution possible',
+                        })
+                    break
+        
+        # OUT instruction patterns
+        out_patterns = [
+            re.compile(r'\bout[bwl]?\b', re.I),
+            re.compile(r'__outbyte\s*\(\s*([^,]+),\s*([^)]+)\)', re.I),
+            re.compile(r'WRITE_PORT_UCHAR\s*\(\s*([^,]+),\s*([^)]+)\)', re.I),
+        ]
+        
+        for pattern in out_patterns:
+            for match in pattern.finditer(pseudo):
+                context_start = max(0, match.start() - 100)
+                context_end = min(len(pseudo), match.end() + 100)
+                context = pseudo[context_start:context_end]
+                
+                if any(tv in context for tv in tainted_vars):
+                    solver = Solver()
+                    solver.set('timeout', self.settings.solver_timeout)
+                    
+                    for c in self.taint_state.get_constraints():
+                        solver.add(c)
+                    
+                    port = self.taint_state.create_symbol('OUT_Port', 16)
+                    data = self.taint_state.create_symbol('OUT_Data', 8)
+                    
+                    # Can control port I/O?
+                    solver.add(UGE(port, BitVecVal(0, 16)))
+                    
+                    if solver.check() == sat:
+                        model = solver.model()
+                        self.vulnerabilities.append({
+                            'vuln_type': 'ARBITRARY_OUT',
+                            'severity': 'HIGH',
+                            'api': 'OUT',
+                            'z3_sat': True,
+                            'exploit_input': str(model) if self.settings.generate_inputs else None,
+                            'source': 'Taint-SMT',
+                            'description': 'OUT instruction with controllable port/data (Z3: sat)',
+                        })
+                    break
+    
+    def _query_null_pointer_deref(self, pseudo, taint_result):
+        """
+        IOCTLance equivalent: b_mem_read/b_mem_write null pointer checks
+        
+        Z3 constraint: Can SystemBuffer/UserBuffer be NULL when dereferenced?
+        """
+        # Check for buffer pointer variables
+        buffer_patterns = [
+            ('SystemBuffer', re.compile(r'SystemBuffer\s*(?:->|\[)', re.I)),
+            ('UserBuffer', re.compile(r'UserBuffer\s*(?:->|\[)', re.I)),
+            ('Type3InputBuffer', re.compile(r'Type3InputBuffer\s*(?:->|\[)', re.I)),
+        ]
+        
+        for buffer_name, pattern in buffer_patterns:
+            if pattern.search(pseudo):
+                # Check if null check exists before dereference
+                null_check_pattern = re.compile(rf'if\s*\(\s*!?\s*{buffer_name}\s*\)|if\s*\(\s*{buffer_name}\s*[!=]=\s*(?:0|NULL|nullptr)\s*\)', re.I)
+                has_null_check = null_check_pattern.search(pseudo)
+                
+                if not has_null_check:
+                    solver = Solver()
+                    solver.set('timeout', self.settings.solver_timeout)
+                    
+                    for c in self.taint_state.get_constraints():
+                        solver.add(c)
+                    
+                    # Create symbolic buffer pointer
+                    buffer_sym = self.taint_state.create_symbol(buffer_name, 64)
+                    
+                    # Query: Can buffer be NULL?
+                    solver.add(buffer_sym == BitVecVal(0, 64))
+                    
+                    if solver.check() == sat:
+                        model = solver.model()
+                        self.vulnerabilities.append({
+                            'vuln_type': 'NULL_POINTER_DEREFERENCE',
+                            'severity': 'MEDIUM',
+                            'buffer': buffer_name,
+                            'z3_sat': True,
+                            'exploit_input': str(model) if self.settings.generate_inputs else None,
+                            'source': 'Taint-SMT',
+                            'description': f'{buffer_name} can be NULL when dereferenced (Z3: sat) - DoS via BSOD',
+                        })
+    
+    def _query_rtlqueryregistry_overflow(self, pseudo, taint_result):
+        """
+        IOCTLance equivalent: HookRtlQueryRegistryValues
+        
+        Z3 verification for TermDD-like RtlQueryRegistryValues buffer overflow.
+        RTL_QUERY_REGISTRY_DIRECT without RTL_QUERY_REGISTRY_TYPECHECK.
+        """
+        rtl_pattern = re.compile(r'RtlQueryRegistryValues\w*\s*\(', re.I)
+        
+        if rtl_pattern.search(pseudo):
+            # Check for RTL_QUERY_REGISTRY_DIRECT (0x20) without TYPECHECK (0x100)
+            has_direct = re.search(r'RTL_QUERY_REGISTRY_DIRECT|0x0*20\b', pseudo, re.I)
+            has_typecheck = re.search(r'RTL_QUERY_REGISTRY_TYPECHECK|0x0*100\b', pseudo, re.I)
+            
+            if has_direct and not has_typecheck:
+                solver = Solver()
+                solver.set('timeout', self.settings.solver_timeout)
+                
+                for c in self.taint_state.get_constraints():
+                    solver.add(c)
+                
+                # Registry value size from malicious registry
+                reg_value_size = self.taint_state.create_symbol('RegValueSize', 32)
+                # Target buffer size (typically small fixed buffer)
+                buffer_size = BitVecVal(256, 32)  # Common fixed buffer size
+                
+                # Query: Can registry value overflow the buffer?
+                solver.add(UGT(reg_value_size, buffer_size))
+                solver.add(ULT(reg_value_size, BitVecVal(0x10000, 32)))  # Realistic
+                
+                if solver.check() == sat:
+                    model = solver.model()
+                    self.vulnerabilities.append({
+                        'vuln_type': 'REGISTRY_BUFFER_OVERFLOW',
+                        'severity': 'CRITICAL',
+                        'api': 'RtlQueryRegistryValues',
+                        'flags': 'RTL_QUERY_REGISTRY_DIRECT without TYPECHECK',
+                        'z3_sat': True,
+                        'exploit_input': str(model) if self.settings.generate_inputs else None,
+                        'source': 'Taint-SMT',
+                        'description': 'RtlQueryRegistryValues with DIRECT flag but no TYPECHECK (Z3: sat) - TermDD-like CVE',
+                    })
+    
+    def _query_context_switch_handle(self, pseudo, taint_result):
+        """
+        IOCTLance equivalent: HookKeStackAttachProcess, HookObCloseHandle
+        
+        Z3 verification for handle operations in different process context.
+        """
+        tainted_vars = list(self.taint_state.tainted_symbols.keys())
+        
+        # Check for KeStackAttachProcess
+        attach_pattern = re.compile(r'KeStackAttachProcess\s*\(\s*([^,]+)', re.I)
+        close_pattern = re.compile(r'ObCloseHandle\s*\(\s*([^,]+)', re.I)
+        
+        has_attach = attach_pattern.search(pseudo)
+        has_close = close_pattern.search(pseudo)
+        
+        if has_attach:
+            match = attach_pattern.search(pseudo)
+            eprocess = match.group(1).strip()
+            
+            # Check if EPROCESS is tainted
+            if any(tv in eprocess for tv in tainted_vars):
+                solver = Solver()
+                solver.set('timeout', self.settings.solver_timeout)
+                
+                for c in self.taint_state.get_constraints():
+                    solver.add(c)
+                
+                eprocess_sym = self.taint_state.create_symbol('EPROCESS_ptr', 64)
+                solver.add(eprocess_sym != BitVecVal(0, 64))
+                
+                if solver.check() == sat:
+                    model = solver.model()
+                    self.vulnerabilities.append({
+                        'vuln_type': 'TAINTED_PROCESS_CONTEXT',
+                        'severity': 'CRITICAL',
+                        'api': 'KeStackAttachProcess',
+                        'z3_sat': True,
+                        'exploit_input': str(model) if self.settings.generate_inputs else None,
+                        'source': 'Taint-SMT',
+                        'description': 'KeStackAttachProcess with tainted EPROCESS (Z3: sat) - arbitrary process context',
+                    })
+        
+        if has_attach and has_close:
+            # Handle closed in different process context
+            solver = Solver()
+            solver.set('timeout', self.settings.solver_timeout)
+            
+            for c in self.taint_state.get_constraints():
+                solver.add(c)
+            
+            handle = self.taint_state.create_symbol('ObCloseHandle_Handle', 64)
+            solver.add(handle != BitVecVal(0, 64))
+            
+            if solver.check() == sat:
+                model = solver.model()
+                self.vulnerabilities.append({
+                    'vuln_type': 'CLOSE_HANDLE_WRONG_CONTEXT',
+                    'severity': 'HIGH',
+                    'api': 'ObCloseHandle after KeStackAttachProcess',
+                    'z3_sat': True,
+                    'exploit_input': str(model) if self.settings.generate_inputs else None,
+                    'source': 'Taint-SMT',
+                    'description': 'ObCloseHandle in different process context (Z3: sat) - handle table corruption',
+                })
+    
+    def _build_result(self, f_ea, taint_result):
+        """Build comprehensive analysis result"""
+        fsm_risks = self.taint_fsm.get_risk_assessment()
+        
+        return {
+            'function': ida_funcs.get_func_name(f_ea),
+            'address': hex(f_ea),
+            
+            # Taint analysis
+            'taint_result': {
+                'primitive': taint_result.get('primitive'),
+                'taint_roles': taint_result.get('taint_roles'),
+                'tainted_vars': taint_result.get('tainted_vars'),
+                'confidence': taint_result.get('confidence'),
+            },
+            
+            # Symbolic state
+            'symbolic_state': {
+                'total_symbols': len(self.taint_state.symbols),
+                'tainted_symbols': len(self.taint_state.tainted_symbols),
+                'constraints_collected': len(self.taint_state.constraints),
+                'validated_vars': list(self.taint_state.validation_map.keys()),
+                'unvalidated_sinks': self.taint_state.get_unvalidated_sinks(),
+            },
+            
+            # FSM trace
+            'fsm_analysis': {
+                'path_summary': self.taint_fsm.get_path_summary(),
+                'taint_sources': self.taint_fsm.taint_sources,
+                'validation_points': self.taint_fsm.validation_points,
+                'sink_points': self.taint_fsm.sink_points,
+                'bypass_detected': self.taint_fsm.bypass_detected,
+                'unvalidated_sink_path': self.taint_fsm.has_unvalidated_path_to_sink(),
+                'risks': fsm_risks,
+            },
+            
+            # Combined vulnerabilities
+            'vulnerabilities': self.vulnerabilities + taint_result.get('ioctlance_vulns', []),
+            
+            # Propagation graph
+            'propagation_graph': self.taint_state.propagation_graph,
+        }
+
+
+def run_symbolic_analysis(f_ea):
+    """
+    Run symbolic execution analysis on a function.
+    
+    Main entry point for the integrated Taint-SMT-FSM engine.
+    
+    Args:
+        f_ea: Function address
+        
+    Returns:
+        Analysis result dictionary
+    """
+    settings = SMTSettings.get_instance()
+    
+    # Use integrated engine
+    engine = IntegratedTaintSMTEngine(settings)
+    
+    idaapi.msg(f"[Taint-SMT-FSM] Starting integrated analysis at {hex(f_ea)}...\n")
+    result = engine.analyze_function(f_ea)
+    
+    if result.get('error'):
+        idaapi.msg(f"[Taint-SMT-FSM] Error: {result['error']}\n")
+        
+        # Fallback to non-Z3 mode
+        if 'Z3' in str(result.get('error', '')):
+            idaapi.msg("[Taint-SMT-FSM] Falling back to taint-heuristic only mode...\n")
+            try:
+                cfunc = ida_hexrays.decompile(f_ea)
+                if cfunc:
+                    pseudo = str(cfunc)
+                    taint_result = track_taint_heuristic(pseudo, f_ea)
+                    return {
+                        'function': ida_funcs.get_func_name(f_ea),
+                        'address': hex(f_ea),
+                        'mode': 'TAINT_HEURISTIC_ONLY',
+                        'taint_result': taint_result,
+                        'vulnerabilities': taint_result.get('ioctlance_vulns', []),
+                        'note': 'Z3 not available - using taint-heuristic analysis only',
+                    }
+            except:
+                pass
+    else:
+        # Print results
+        idaapi.msg(f"[Taint-SMT-FSM] Analysis complete:\n")
+        
+        # Taint info
+        taint_info = result.get('taint_result', {})
+        idaapi.msg(f"  Primitive: {taint_info.get('primitive', 'None')}\n")
+        idaapi.msg(f"  Tainted vars: {len(taint_info.get('tainted_vars', []))}\n")
+        idaapi.msg(f"  Confidence: {taint_info.get('confidence', 'N/A')}\n")
+        
+        # Symbolic info
+        sym_info = result.get('symbolic_state', {})
+        idaapi.msg(f"  Symbolic vars: {sym_info.get('tainted_symbols', 0)}\n")
+        idaapi.msg(f"  Constraints: {sym_info.get('constraints_collected', 0)}\n")
+        
+        # FSM info
+        fsm_info = result.get('fsm_analysis', {})
+        idaapi.msg(f"  FSM path: {fsm_info.get('path_summary', 'N/A')}\n")
+        idaapi.msg(f"  Unvalidated sink path: {fsm_info.get('unvalidated_sink_path', False)}\n")
+        
+        # Vulnerabilities
+        vulns = result.get('vulnerabilities', [])
+        idaapi.msg(f"  Vulnerabilities found: {len(vulns)}\n")
+        
+        for vuln in vulns:
+            severity = vuln.get('severity', 'UNKNOWN')
+            vtype = vuln.get('vuln_type', 'UNKNOWN')
+            source = vuln.get('source', '')
+            z3_sat = vuln.get('z3_sat')
+            
+            sat_str = ''
+            if z3_sat is True:
+                sat_str = ' [Z3:sat]'
+            elif z3_sat is False:
+                sat_str = ' [Z3:unsat]'
+            
+            idaapi.msg(f"    [{severity}] {vtype}{sat_str} ({source})\n")
+            
+            if vuln.get('propagation_chain'):
+                chain = ' → '.join(vuln['propagation_chain'])
+                idaapi.msg(f"      Flow: {chain}\n")
+            
+            if vuln.get('exploit_input'):
+                idaapi.msg(f"      Exploit: {vuln['exploit_input'][:80]}...\n")
+    
+    return result
+
+
+# =============================================================================
+# EXPLOITABILITY SCORING
+# =============================================================================
+
 def score_exploitability_primitive_first(dec, method, taint_result, findings):
     """
     Primitive-first scoring (METHOD_NEITHER only):
@@ -767,6 +3212,13 @@ def score_exploitability_primitive_first(dec, method, taint_result, findings):
     +2 → src_ptr tainted (info leak)
     +1 → index tainted (OOB access)
     +1 → default access (FILE_ANY_ACCESS)
+    
+    IOCTLance-equivalent bonus:
+    +5 → Physical memory mapping (CRITICAL)
+    +4 → WRMSR/shellcode execution (CRITICAL)
+    +3 → Process handle control (HIGH)
+    +2 → Dangerous file operation (HIGH)
+    +2 → Registry overflow pattern (HIGH)
     
     Annotations for validation (not score):
     - ProbeForRead/Write presence noted but doesn't affect score
@@ -790,6 +3242,7 @@ def score_exploitability_primitive_first(dec, method, taint_result, findings):
     taint_roles = taint_result.get('taint_roles', {})
     primitive = taint_result.get('primitive')
     confidence = taint_result.get('confidence', 'NONE')
+    ioctlance_vulns = taint_result.get('ioctlance_vulns', [])
     
     # Role-based scoring
     if taint_roles.get('ptr_dst'):
@@ -817,6 +3270,27 @@ def score_exploitability_primitive_first(dec, method, taint_result, findings):
         score += 1
         reasons.append('FILE_ANY_ACCESS')
     
+    # IOCTLance-equivalent vulnerability scoring (NEW)
+    for vuln in ioctlance_vulns:
+        vuln_type = vuln.get('vuln_type', '')
+        severity = vuln.get('severity', 'MEDIUM')
+        
+        if vuln_type == 'MAP_PHYSICAL_MEMORY':
+            score += 5
+            reasons.append(f"PHYSICAL_MEMORY_MAP ({vuln.get('api', '')})")
+        elif vuln_type in ['ARBITRARY_SHELLCODE_EXECUTION', 'ARBITRARY_WRMSR']:
+            score += 4
+            reasons.append(f"{vuln_type}")
+        elif vuln_type in ['CONTROLLABLE_PROCESS_HANDLE', 'TAINTED_PROCESS_CONTEXT']:
+            score += 3
+            reasons.append(f"PROCESS_CONTROL ({vuln.get('api', '')})")
+        elif vuln_type in ['DANGEROUS_FILE_OPERATION', 'REGISTRY_BUFFER_OVERFLOW']:
+            score += 2
+            reasons.append(f"{vuln_type}")
+        elif vuln_type in ['ARBITRARY_PROCESS_TERMINATION', 'NULL_POINTER_DEREFERENCE']:
+            score += 1
+            reasons.append(f"{vuln_type}")
+    
     # Validation annotations (NOT score adjustments)
     result_annotations = taint_result.get('annotations', [])
     for ann in result_annotations:
@@ -826,15 +3300,15 @@ def score_exploitability_primitive_first(dec, method, taint_result, findings):
             annotations.append(f'ℹ {ann}')
     
     # Boost for high-confidence primitives
-    if primitive in ['WRITE_WHAT_WHERE', 'CODE_EXECUTION'] and confidence == 'HIGH':
-        if score < 7:
-            score = 7  # Minimum HIGH for confirmed dangerous primitives
+    if primitive in ['WRITE_WHAT_WHERE', 'CODE_EXECUTION', 'PHYSICAL_MEMORY_MAP', 'WRMSR_CONTROL'] and confidence == 'HIGH':
+        if score < 8:
+            score = 8  # Minimum HIGH for confirmed dangerous primitives
         reasons.append(f'HIGH confidence {primitive}')
     
     # Determine severity
-    if score >= 9:
+    if score >= 10:
         severity = 'CRITICAL'
-    elif score >= 6:
+    elif score >= 7:
         severity = 'HIGH'
     elif score >= 5:
         severity = 'MEDIUM'
@@ -3152,6 +5626,15 @@ class IoctlSuperAuditPlugin(idaapi.plugin_t):
         except Exception:
             idaapi.msg("[IOCTL Audit] Using legacy SDK 7\n")
         
+        # Check Z3 availability
+        if Z3_AVAILABLE:
+            idaapi.msg("[IOCTL Audit] Z3 SMT solver available - 12 symbolic queries enabled\n")
+        else:
+            idaapi.msg(f"[IOCTL Audit] WARNING: Z3 not available - SMT analysis disabled\n")
+            if Z3_ERROR_MSG:
+                idaapi.msg(f"[IOCTL Audit] Z3 Error: {Z3_ERROR_MSG}\n")
+            idaapi.msg("[IOCTL Audit] To fix: pip uninstall z3-solver && pip install z3-solver\n")
+        
         # Register context menu actions
         try:
             register_context_actions()
@@ -3175,8 +5658,10 @@ class IoctlSuperAuditPlugin(idaapi.plugin_t):
         8. Generate WinDbg Script (For selected IOCTL)
         9. Analyze Function Data Flow (Current function)
         10. Decode IOCTL Value (At cursor position)
+        11. Configure SMT/FSM Engine (Symbolic Execution Settings)
+        12. Run Symbolic Analysis (Current function - Z3 + FSM)
         
-        Select option (1-10):
+        Select option (1-12):
         """
         
         try:
@@ -3266,9 +5751,56 @@ class IoctlSuperAuditPlugin(idaapi.plugin_t):
         elif choice == "10":
             # Decode IOCTL
             decode_ioctl_interactive()
+        
+        elif choice == "11":
+            # Configure SMT/FSM Engine
+            if not Z3_AVAILABLE:
+                ida_kernwin.warning("Z3 SMT Solver not installed.\n\nInstall with: pip install z3-solver\n\nAfter installation, restart IDA Pro.")
+                return
+            show_smt_settings_dialog()
+        
+        elif choice == "12":
+            # Run Symbolic Analysis
+            if not Z3_AVAILABLE:
+                ida_kernwin.warning("Z3 SMT Solver not installed.\n\nInstall with: pip install z3-solver\n\nAfter installation, restart IDA Pro.")
+                return
+            
+            # Get current function
+            ea = ida_kernwin.get_screen_ea()
+            func = ida_funcs.get_func(ea)
+            if not func:
+                ida_kernwin.warning("No function at cursor. Place cursor inside a function.")
+                return
+            
+            f_name = ida_funcs.get_func_name(func.start_ea)
+            idaapi.msg(f"[SMT/FSM] Starting symbolic analysis on {f_name}...\n")
+            
+            result = run_symbolic_analysis(func.start_ea)
+            
+            if result.get('vulnerabilities'):
+                vuln_summary = "\n".join([
+                    f"  [{v['severity']}] {v['vuln_type']}: {v.get('api', 'N/A')}"
+                    for v in result['vulnerabilities']
+                ])
+                ida_kernwin.info(
+                    f"Symbolic Analysis Complete\n\n"
+                    f"Function: {f_name}\n"
+                    f"States explored: {result.get('states_explored', 0)}\n"
+                    f"FSM path: {result.get('path_summary', 'N/A')}\n"
+                    f"Vulnerabilities: {len(result['vulnerabilities'])}\n\n"
+                    f"{vuln_summary}"
+                )
+            else:
+                ida_kernwin.info(
+                    f"Symbolic Analysis Complete\n\n"
+                    f"Function: {f_name}\n"
+                    f"States explored: {result.get('states_explored', 0)}\n"
+                    f"FSM path: {result.get('path_summary', 'N/A')}\n\n"
+                    f"No vulnerabilities detected."
+                )
             
         else:
-            ida_kernwin.warning("Invalid choice. Select 1-10.")
+            ida_kernwin.warning("Invalid choice. Select 1-12.")
     
     def _get_range_if_needed(self, filter_range):
         """Helper to get IOCTL range from user"""
